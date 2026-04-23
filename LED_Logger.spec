@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['LED_Logger_V01_BETA.py'],
+    ['LED_Logger.py'],
     pathex=[],
     binaries=[],
     datas=[('logo.ico', '.')],
@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='LED_Logger_V8',
+    name='LED_Logger',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

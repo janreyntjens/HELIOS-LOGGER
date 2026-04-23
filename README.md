@@ -12,7 +12,7 @@ GUI tool om errors en alerts van LED processors (Helios) te loggen via WebSocket
 
 ```powershell
 pip install PySide6 requests
-python LED_Logger_V01_BETA.py
+python LED_Logger.py
 ```
 
 ## Configuratie
@@ -33,7 +33,7 @@ Kopieer `config.example.json` naar `config.json` en pas IP's en namen aan:
 
 ```powershell
 pip install pyinstaller
-pyinstaller LED_Logger_V8.spec
+pyinstaller LED_Logger.spec
 ```
 
 Output komt in `dist/` (niet meegecommit).
@@ -42,7 +42,7 @@ Output komt in `dist/` (niet meegecommit).
 
 | Bestand | Doel |
 |---|---|
-| `LED_Logger_V01_BETA.py` | Hoofdscript (GUI + websocket + http server) |
+| `LED_Logger.py` | Hoofdscript (GUI + websocket + http server) |
 | `config.example.json` | Voorbeeld configuratie |
-| `LED_Logger_V8.spec` | PyInstaller build recept |
+| `LED_Logger.spec` | PyInstaller build recept |
 | `logo.ico` / `bglogo.png` | Assets |
