@@ -31,7 +31,7 @@ except ImportError as e:
 
 # --- CONSTANTEN ---
 APP_NAME = "LED Logger"
-VERSION = "1.0"
+VERSION = "1.0.1"
 LOGO_FILE = "logo.ico"  # <--- HIER ZAT DE FOUT (ontbrekend aanhalingsteken)
 CONFIG_FILE = "config.json"
 HISTORY_FILE = "history.json"
