@@ -1487,19 +1487,21 @@ class ProcessorCard(QFrame):
         if e.button() == Qt.LeftButton: self.clicked.emit(self.ip)
         super().mousePressEvent(e)
 
-    def set_status(self, s, force=False): 
-        if not force and self.status == "error" and s == "ok": return
+    def set_status(self, s, force=False):
+        # offline mag altijd gezet worden (netwerk weg); anders sticky error bewaren
+        if not force and s == "ok" and self.status == "error": return
         self.status = s; self.update_style()
 
     def force_error(self): self.status = "error"; self.update_style()
+    def set_offline(self): self.status = "offline"; self.update_style()
     def set_selected(self, s): self.is_selected = s; self.update_style()
     def set_highlighted(self, highlighted):
         self.is_highlighted = highlighted
         self.update_style()
     def update_style(self):
-        c = "#444"
-        if self.status == "ok": c = "#2ecc71"
-        elif self.status == "error": c = "#e74c3c"
+        c = "#444"  # grijs = offline/onbekend
+        if self.status == "ok": c = "#2ecc71"    # groen
+        elif self.status == "error": c = "#e74c3c"  # rood
         b = "2px solid #2a82da" if self.is_selected else "2px solid transparent"
         if self.is_highlighted:
             bg = "#0a3a6a"
@@ -2040,7 +2042,18 @@ class LEDLoggerApp(QMainWindow):
         msg = self._inject_processor_name_in_csv(msg, ip)
         receiver_info = self._receiver_info_from_coex_trap(msg)
         self.add_log_entry(color, msg, ip, receiver_info=receiver_info, oid=oid)
-        
+
+        # Update processor balkje op basis van trap-kleur
+        if ip in self.processor_widgets:
+            card = self.processor_widgets[ip]
+            if color == "red":
+                card.force_error()
+            elif color == "green":
+                sock = self.sockets.get(ip)
+                active = getattr(sock, "active_errors", set())
+                if not active:
+                    card.set_status("ok", force=True)
+
         # Poll backup status als er een ethercon (Eth port/Eth ports) error is
         if color == "red" and "eth port" in msg.lower():
             sock = self.sockets.get(ip)
@@ -2099,18 +2112,28 @@ class LEDLoggerApp(QMainWindow):
     @Slot(str, str, str)
     def on_socket_error(self, color, msg, ip):
         if ip in self.processor_widgets:
-            if color == "green":
-                # Sticky error behavior: eenmaal rood blijft rood tot handmatige clear.
-                self.processor_widgets[ip].set_status("ok", force=False)
+            card = self.processor_widgets[ip]
+            sock = self.sockets.get(ip)
+            is_unreachable = "unreachable" in msg.lower() or "SNMP unreachable" in msg
+            if is_unreachable:
+                # Geen netwerk → grijs (overschrijft ook sticky error)
+                card.set_offline()
+            elif color == "green":
+                # Online/Recover: groen zetten tenzij er nog actieve errors zijn
+                active = getattr(sock, "active_errors", set())
+                if not active:
+                    card.set_status("ok", force=True)
+                else:
+                    card.force_error()  # er zijn nog open errors
+            elif color == "red":
+                card.force_error()
             elif color == "orange":
-                # Warning: niet rood maken, maar wel uit "offline" halen
-                if self.processor_widgets[ip].status not in ("error",):
-                    self.processor_widgets[ip].set_status("ok", force=False)
+                # Warning: alleen uit offline halen, niet naar rood
+                if card.status == "offline":
+                    card.set_status("ok", force=True)
             elif color == "gray":
                 # Informatieve melding, status niet aanpassen
                 pass
-            else:
-                self.processor_widgets[ip].force_error()
         # Update webserver status op basis van de actuele kaartstatus (ook sticky).
         if ip in LogWebServer.device_statuses:
             card = self.processor_widgets.get(ip)
