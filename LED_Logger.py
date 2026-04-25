@@ -31,7 +31,7 @@ except ImportError as e:
 
 # --- CONSTANTEN ---
 APP_NAME = "LED Logger"
-VERSION = "1.0.1"
+VERSION = "1.1.0-beta"
 LOGO_FILE = "logo.ico"  # <--- HIER ZAT DE FOUT (ontbrekend aanhalingsteken)
 CONFIG_FILE = "config.json"
 HISTORY_FILE = "history.json"
@@ -232,6 +232,875 @@ class HeliosSocket(QObject):
         self.retry_timer.stop()
         self.ws.close()
 
+# ==========================================
+#   NOVASTAR COEX (MX2000 Pro / MX40 Pro / MX6000 Pro / ...)
+#   Werkt via SNMP v2c. Polt elke 10s de belangrijkste health OIDs
+#   en luistert daarnaast op poort 162 voor TRAP events.
+# ==========================================
+
+# Belangrijkste OIDs (ENTERPRISE 319 = NovaStar)
+COEX_OIDS = {
+    "ctrl_model":          "1.3.6.1.4.1.319.10.10.1.2",
+    "ctrl_fw":             "1.3.6.1.4.1.319.10.10.1.3",
+    "ctrl_name":           "1.3.6.1.4.1.319.10.10.1.4",
+    "ctrl_serial":         "1.3.6.1.4.1.319.10.10.1.6",
+    "ctrl_ip":             "1.3.6.1.4.1.319.10.10.1.8",
+    "genlock_status":      "1.3.6.1.4.1.319.10.10.10.9.1",   # 0=disconnected, 1=connected
+    "monitor_status":      "1.3.6.1.4.1.319.10.200.6",        # 0=normal, 2=fault (overall)
+    "input_src_status":    "1.3.6.1.4.1.319.10.10.50.2.1.2",  # 1=connected, 0=disconnected (IN1)
+    "n_input_cards":       "1.3.6.1.4.1.319.10.100.4",
+}
+
+# Status mapping
+COEX_STATUS_MAP = {0: ("normal", "green"), 1: ("warning", "orange"), 2: ("fault", "red")}
+COEX_TRAP_PORT = 10162
+COEX_BACKUP_API_DEFAULT_ENABLED = False  # Veilig standaard uit; per device opt-in via config.
+COEX_BACKUP_API_POLL_INTERVAL_SEC = 120  # Lage frequentie om netwerkimpact minimaal te houden.
+COEX_BACKUP_API_TIMEOUT_SEC = 0.8
+COEX_BACKUP_API_DEFAULT_LOG_EVERY_POLL = False
+COEX_BACKUP_API_DEFAULT_PORT = 8001
+
+COEX_BACKUP_STATUS_LABELS = {
+    108: "No Backup Processor",
+    109: "primary in use, backup standby",
+    110: "primary in use, backup in use",
+    111: "primary in use, backup failed",
+    112: "primary failed, backup standby",
+    113: "primary failed, backup in use",
+    114: "primary failed, backup failed",
+}
+
+class NovastarCoexSocket(QObject):
+    """SNMP-based monitor voor Novastar COEX processors (MX2000 Pro etc.)."""
+    error_detected = Signal(str, str, str)  # color, message, ip
+
+    def __init__(
+        self,
+        ip,
+        name,
+        community="public",
+        port_map=None,
+        api_backup_enabled=False,
+        api_backup_poll_interval=COEX_BACKUP_API_POLL_INTERVAL_SEC,
+        api_backup_log_every_poll=COEX_BACKUP_API_DEFAULT_LOG_EVERY_POLL,
+        api_backup_port=COEX_BACKUP_API_DEFAULT_PORT,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.ip = ip.strip()
+        self.name = name
+        self.community = community
+        self.port_map = port_map if isinstance(port_map, dict) else {}
+        self.api_backup_enabled = bool(api_backup_enabled)
+        try:
+            self.api_backup_poll_interval = max(5, int(api_backup_poll_interval))
+        except (TypeError, ValueError):
+            self.api_backup_poll_interval = COEX_BACKUP_API_POLL_INTERVAL_SEC
+        self.api_backup_log_every_poll = bool(api_backup_log_every_poll)
+        try:
+            self.api_backup_port = int(api_backup_port)
+        except (TypeError, ValueError):
+            self.api_backup_port = COEX_BACKUP_API_DEFAULT_PORT
+        self.active_errors = set()
+        self.last_seen_ok = False
+        self.trap_server_configured = False  # auto-configure trap target after first online
+        self._eth_port_bits = {}  # key=(slot, port) -> laatste bitwaarde
+        self._ctrl_name = name
+        self._ctrl_model = name
+        self._last_backup_status = None
+        self._backup_poll_on_error_done = False  # eenmalige poll bij error
+
+        if self.api_backup_enabled:
+            mode_txt = "change-only"
+            if self.api_backup_log_every_poll:
+                mode_txt = "every-poll"
+            self.error_detected.emit(
+                "gray",
+                f"{self.name}: COEX backup API monitor enabled ({mode_txt}, poll elke {self.api_backup_poll_interval}s, port {self.api_backup_port})",
+                self.ip,
+            )
+
+        # Lazy import zodat de app ook werkt zonder pysnmp (alleen Helios)
+        try:
+            import asyncio
+            from pysnmp.hlapi.asyncio import (SnmpEngine, CommunityData, UdpTransportTarget,
+                                              ContextData, ObjectType, ObjectIdentity, getCmd, setCmd)
+            from pysnmp.proto.rfc1902 import OctetString as SnmpOctetString, Integer as SnmpInteger
+            self._asyncio = asyncio
+            self._snmp = dict(SnmpEngine=SnmpEngine, CommunityData=CommunityData,
+                              UdpTransportTarget=UdpTransportTarget, ContextData=ContextData,
+                              ObjectType=ObjectType, ObjectIdentity=ObjectIdentity,
+                              getCmd=getCmd, setCmd=setCmd,
+                              OctetString=SnmpOctetString, Integer=SnmpInteger)
+            self._available = True
+        except ImportError as e:
+            self._available = False
+            self.error_detected.emit("red", f"{self.name}: pysnmp not installed ({e}) - run 'pip install pysnmp<7'", self.ip)
+            self._asyncio = None
+            self._snmp = {}
+
+        # Poll timer (korter interval voor snellere ketenfout-detectie)
+        self.poll_timer = QTimer(self)
+        self.poll_timer.timeout.connect(self.poll_health)
+        self.poll_timer.start(2000)  # elke 2s
+        # Eerste scan na 1s zodat GUI eerst klaar is
+        QTimer.singleShot(1000, self.poll_health)
+
+    def _poll_backup_status_api(self):
+        """Poll backupStatus via HTTP API (geen interval check - direct aanroepen)"""
+        if not self.api_backup_enabled:
+            return
+
+        # Bij errors: slechts 1 keer pollen
+        if self._backup_poll_on_error_done:
+            return  # Al gepolleerd bij deze error
+        self._backup_poll_on_error_done = True
+
+        try:
+            url = f"http://{self.ip}:{self.api_backup_port}/api/v1/device/monitor/info"
+            headers = {"Device-Key": f"{self.ip}:{self.api_backup_port}"}
+            params = {"isNeedCabinetInfo": "false"}
+            resp = requests.get(url, headers=headers, params=params, timeout=COEX_BACKUP_API_TIMEOUT_SEC)
+            if resp.status_code != 200:
+                if self.api_backup_log_every_poll:
+                    self.error_detected.emit(
+                        "gray",
+                        f"Info,Controller,{self._ctrl_name},{self._ctrl_model},{self.ip},--,Backup status poll : HTTP {resp.status_code}",
+                        self.ip,
+                    )
+                return
+
+            payload = resp.json() if resp.content else {}
+            if not isinstance(payload, dict):
+                return
+
+            data = payload.get("data", {}) if isinstance(payload.get("data", {}), dict) else {}
+            backup_raw = data.get("backupStatus")
+
+            # Sommige firmwareversies geven int (109..114), andere geven objecten terug.
+            backup_status = None
+            status_aux = None
+            if isinstance(backup_raw, dict):
+                # Prefer errCode wanneer aanwezig; dat bevat meestal de statuscode.
+                for key in ("errCode", "code", "value", "status"):
+                    if key in backup_raw:
+                        try:
+                            value_int = int(backup_raw.get(key))
+                        except (ValueError, TypeError):
+                            continue
+                        if key == "status":
+                            status_aux = value_int
+                        else:
+                            backup_status = value_int
+                            break
+                if backup_status is None:
+                    backup_status = status_aux
+            else:
+                try:
+                    backup_status = int(backup_raw)
+                except (ValueError, TypeError):
+                    backup_status = None
+
+            if backup_status is None:
+                if self.api_backup_log_every_poll:
+                    self.error_detected.emit(
+                        "gray",
+                        f"Info,Controller,{self._ctrl_name},{self._ctrl_model},{self.ip},--,Backup status poll : unexpected payload {backup_raw}",
+                        self.ip,
+                    )
+                return
+
+            changed = (backup_status != self._last_backup_status)
+            if not changed and not self.api_backup_log_every_poll:
+                return
+
+            self._last_backup_status = backup_status
+            label = COEX_BACKUP_STATUS_LABELS.get(backup_status, "unknown")
+            prefix = "Backup status changed" if changed else "Backup status poll"
+            if status_aux is not None:
+                label = f"{label}; status={status_aux}"
+            self.error_detected.emit(
+                "gray",
+                f"Info,Controller,{self._ctrl_name},{self._ctrl_model},{self.ip},--,{prefix} : {label} ({backup_status})",
+                self.ip,
+            )
+        except Exception as e:
+            if self.api_backup_log_every_poll:
+                self.error_detected.emit(
+                    "gray",
+                    f"Info,Controller,{self._ctrl_name},{self._ctrl_model},{self.ip},--,Backup status poll failed : {e}",
+                    self.ip,
+                )
+            return
+
+    def _run_async(self, coro):
+        """Voer een coroutine uit in een tijdelijke event loop en ruim alle pending tasks netjes op.
+        Dit voorkomt 'Task was destroyed but it is pending' warnings van pysnmp's AsyncioDispatcher."""
+        asyncio = self._asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro)
+        finally:
+            try:
+                # 1. Cancel alle nog hangende tasks
+                pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+                for t in pending:
+                    t.cancel()
+                # 2. Wacht tot ze daadwerkelijk klaar zijn (cancellation propageren)
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                # 3. Shutdown async generators
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+                try:
+                    asyncio.set_event_loop(None)
+                except Exception:
+                    pass
+
+    def _snmp_get(self, oid, timeout=2):
+        """Eenmalig SNMP GET. Geeft (value, error_str) terug. Sync wrapper rond asyncio."""
+        if not self._available:
+            return None, "pysnmp missing"
+        try:
+            S = self._snmp
+
+            async def _do_get():
+                target = S["UdpTransportTarget"]((self.ip, 161), timeout=timeout, retries=0)
+                errInd, errStat, errIdx, varBinds = await S["getCmd"](
+                    S["SnmpEngine"](),
+                    S["CommunityData"](self.community, mpModel=1),
+                    target,
+                    S["ContextData"](),
+                    S["ObjectType"](S["ObjectIdentity"](oid)),
+                )
+                return errInd, errStat, errIdx, varBinds
+
+            errInd, errStat, errIdx, varBinds = self._run_async(_do_get())
+
+            if errInd:
+                return None, str(errInd)
+            if errStat:
+                return None, str(errStat.prettyPrint())
+            for vb in varBinds:
+                return vb[1].prettyPrint(), None
+            return None, "no varbinds"
+        except Exception as e:
+            return None, str(e)
+
+    def _snmp_set(self, oid, value, value_type="OctetString", timeout=2):
+        """SNMP SET helper. value_type = 'OctetString' of 'Integer'."""
+        if not self._available:
+            return False, "pysnmp missing"
+        try:
+            S = self._snmp
+            if value_type == "Integer":
+                value_obj = S["Integer"](int(value))
+            else:
+                value_obj = S["OctetString"](str(value))
+
+            async def _do_set():
+                target = S["UdpTransportTarget"]((self.ip, 161), timeout=timeout, retries=0)
+                errInd, errStat, errIdx, varBinds = await S["setCmd"](
+                    S["SnmpEngine"](),
+                    S["CommunityData"](self.community, mpModel=1),
+                    target,
+                    S["ContextData"](),
+                    S["ObjectType"](S["ObjectIdentity"](oid), value_obj),
+                )
+                return errInd, errStat, errIdx, varBinds
+
+            errInd, errStat, errIdx, varBinds = self._run_async(_do_set())
+
+            if errInd:
+                return False, str(errInd)
+            if errStat:
+                return False, str(errStat.prettyPrint())
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
+    def _configure_trap_target(self):
+        """Configureer COEX om SNMP traps naar deze PC te sturen."""
+        # Detecteer eigen IP (richting de COEX)
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((self.ip, 1))  # geen actuele connectie, alleen routing
+            local_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            local_ip = None
+
+        if not local_ip:
+            return
+
+        target = f"{local_ip}/{COEX_TRAP_PORT}"
+        # SNMP Trap server (OID: 1.3.6.1.4.1.319.10.200.1, OctetString)
+        ok1, err1 = self._snmp_set("1.3.6.1.4.1.319.10.200.1", target, "OctetString")
+        # Trap reporting period (OID: 1.3.6.1.4.1.319.10.200.2, Integer)
+        # 0 = direct/immediate events, 1 = samenvatten per minuut.
+        ok2, err2 = self._snmp_set("1.3.6.1.4.1.319.10.200.2", 0, "Integer")
+        # Trap On (OID: 1.3.6.1.4.1.319.10.200.4, Integer 1=On)
+        ok3, err3 = self._snmp_set("1.3.6.1.4.1.319.10.200.4", 1, "Integer")
+
+        # Lees actuele trap target terug om vals-negatieve melding te voorkomen.
+        current_target, read_err = self._snmp_get("1.3.6.1.4.1.319.10.200.1")
+        target_is_set = (current_target == target)
+
+        if ok1 and ok3:
+            self.error_detected.emit("green",
+                f"{self.name}: SNMP trap target auto-configured -> {target}", self.ip)
+            self.trap_server_configured = True
+        elif target_is_set:
+            self.trap_server_configured = True
+            self.error_detected.emit("green",
+                f"{self.name}: Trap target al correct ingesteld -> {target} (via device/VMP)", self.ip)
+        else:
+            # Markeer als 'configured' om herhaalde foutmeldingen te voorkomen.
+            self.trap_server_configured = True
+            details = []
+            if err1:
+                details.append(f"200.1={err1}")
+            if err2:
+                details.append(f"200.2={err2}")
+            if err3:
+                details.append(f"200.4={err3}")
+            if read_err:
+                details.append(f"readback={read_err}")
+            detail_txt = f" | details: {'; '.join(details)}" if details else ""
+            self.error_detected.emit("gray",
+                f"{self.name}: Auto-trap-config niet volledig gelukt (mogelijk firmware beperking of SNMP write-rechten). "
+                f"Stel handmatig in via VMP (Trap server: {target}){detail_txt}", self.ip)
+
+    def poll_health(self):
+        """Vraagt key OIDs op en emit alerts bij verandering."""
+        # Reset poll-on-error flag als alle errors opgelost zijn
+        if not self.active_errors:
+            self._backup_poll_on_error_done = False
+
+        if not self._available:
+            return
+
+        # 1. Reachability check via ctrl_model (werkt op alle COEX modellen)
+        model, err = self._snmp_get(COEX_OIDS["ctrl_model"])
+
+        # "noSuchName" / "noSuchObject" / "noSuchInstance" betekent: device antwoordt wél, alleen OID niet aanwezig
+        # Dat zien we als ONLINE (alleen netwerk/timeout = offline)
+        oid_missing_responses = ("nosuchname", "nosuchobject", "nosuchinstance")
+        device_responding = (err is None) or any(s in str(err).lower() for s in oid_missing_responses)
+
+        if not device_responding:
+            err_id = "unreachable"
+            if err_id not in self.active_errors:
+                self.active_errors.add(err_id)
+                self.error_detected.emit("red", f"{self.name}: SNMP unreachable ({err})", self.ip)
+            self.last_seen_ok = False
+            return
+
+        # Device responds — clear unreachable
+        if "unreachable" in self.active_errors:
+            self.active_errors.discard("unreachable")
+
+        if not self.last_seen_ok:
+            self.last_seen_ok = True
+            fw, _ = self._snmp_get(COEX_OIDS["ctrl_fw"])
+            ctrl_name, _ = self._snmp_get(COEX_OIDS["ctrl_name"])
+            if ctrl_name:
+                self._ctrl_name = ctrl_name
+                # Sync terug naar config-naam als de gebruiker geen eigen naam heeft ingesteld
+                # (d.w.z. de naam begint met een generieke prefix of is leeg)
+                generic_prefixes = ("Helios-", "COEX-", "BR-", "CL-", "DEV-")
+                if not self.name or any(self.name.startswith(p) for p in generic_prefixes):
+                    self.name = ctrl_name
+                # Anders: behoud de gebruikersnaam als _ctrl_name voor berichtopmaak
+                else:
+                    self._ctrl_name = self.name
+            if model:
+                self._ctrl_model = model
+            details = []
+            if model: details.append(f"Model={model}")
+            if ctrl_name: details.append(f"Name={ctrl_name}")
+            if fw: details.append(f"FW={fw}")
+            extra = " | ".join(details) if details else "responding to SNMP"
+            self.error_detected.emit("green", f"{self.name}: Online | {extra}", self.ip)
+            # Auto-configure trap target on first online detection
+            if not self.trap_server_configured:
+                self._configure_trap_target()
+
+        # 2. Overall monitor status
+        val, err = self._snmp_get(COEX_OIDS["monitor_status"])
+        if err is None and val is not None:
+            try:
+                status_int = int(val)
+                err_id = "overall_status"
+                if status_int == 2:
+                    if err_id not in self.active_errors:
+                        self.active_errors.add(err_id)
+                        self.error_detected.emit("red",
+                            f"Error,Controller,{self._ctrl_name},{self._ctrl_model},{self.ip},--, Status FAULT",
+                            self.ip)
+                elif status_int == 0:
+                    if err_id in self.active_errors:
+                        self.active_errors.discard(err_id)
+                        self.error_detected.emit("green",
+                            f"Recover,Controller,{self._ctrl_name},{self._ctrl_model},{self.ip},--, Status NORMAL",
+                            self.ip)
+            except (ValueError, TypeError):
+                pass
+
+        # 3. Genlock status
+        val, err = self._snmp_get(COEX_OIDS["genlock_status"])
+        if err is None and val is not None:
+            try:
+                gl = int(val)
+                err_id = "genlock"
+                if gl == 0:
+                    if err_id not in self.active_errors:
+                        self.active_errors.add(err_id)
+                        self.error_detected.emit("orange",
+                            f"Warning,Controller,{self._ctrl_name},{self._ctrl_model},{self.ip},--, Genlock: Source disconnected",
+                            self.ip)
+                else:
+                    if err_id in self.active_errors:
+                        self.active_errors.discard(err_id)
+                        self.error_detected.emit("green",
+                            f"Recover,Controller,{self._ctrl_name},{self._ctrl_model},{self.ip},--, Genlock: Source connected",
+                            self.ip)
+            except ValueError:
+                pass
+
+        # 4. HDMI input source status
+        src_val, src_err = self._snmp_get(COEX_OIDS["input_src_status"])
+        if src_err is None and src_val is not None:
+            try:
+                src_state = int(src_val)
+                src_key = "_input_source_in1"
+                prev_state = self._eth_port_bits.get(src_key)
+                self._eth_port_bits[src_key] = src_state
+                if prev_state is not None and src_state != prev_state:
+                    in_label = "HDMI Source"
+                    if src_state == 0:
+                        self.error_detected.emit("red",
+                            f"Error,Controller,{self._ctrl_name},{self._ctrl_model},{self.ip},--,{in_label}: Source disconnected",
+                            self.ip)
+                    else:
+                        self.error_detected.emit("green",
+                            f"Recover,Controller,{self._ctrl_name},{self._ctrl_model},{self.ip},--,{in_label}: Source connected",
+                            self.ip)
+            except (ValueError, TypeError):
+                pass
+
+        # 5. Receiving cards per ETH port — disconnect detectie via rc count
+        # 5. Ethercon output events komen uitsluitend uit traps.
+        # De OID 319.10.20.1.2.*.5 is geen betrouwbare per-poort linkstatus en
+        # veroorzaakte foutieve "Eth Port1" labels bij andere poorten.
+
+        # 6. API backup-status polling gebeurt al bovenaan deze methode.
+
+    def stop(self):
+        try:
+            self.poll_timer.stop()
+        except Exception:
+            pass
+
+
+class CoexTrapListener(QThread):
+    """Luistert op UDP poort voor SNMP traps van COEX processors.
+    Eén instance voor de hele applicatie (poort kan maar 1x gebonden worden).
+    """
+    trap_received = Signal(str, str, str, str)  # color, message, source_ip, oid
+
+    def __init__(self, port=COEX_TRAP_PORT, ip_names=None, parent=None):
+        super().__init__(parent)
+        self.port = port
+        self.ip_names = ip_names or {}  # {ip: config_naam}
+        self.running = True
+
+    def run(self):
+        """
+        Raw UDP socket trap listener — werkt met elke community string (inclusief leeg).
+        Decodeert SNMPv1 varbinds via pyasn1 en mapt bekende OIDs naar leesbare events.
+        """
+        import socket as _socket
+
+        PORT_LINK_PREFIX       = "1.3.6.1.4.1.319.10.120."
+        INPUT_CARD_PREFIX      = "1.3.6.1.4.1.319.10.110."
+        CONTROLLER_INFO_PREFIX = "1.3.6.1.4.1.319.10.100."
+        SCREEN_INFO_PREFIX     = "1.3.6.1.4.1.319.10.130."
+        MULTIFUNCTION_PREFIX   = "1.3.6.1.4.1.319.10.30.7."
+        ip_names = self.ip_names  # {ip: config_naam}
+        # Poortnamen zoals VMP ze toont (1-3 OPT, 4-6 Eth met globaal poortnummer)
+        PORT_NAMES = {
+            1: "OPT Port1", 2: "OPT Port2", 3: "OPT Port3",
+            4: "Eth Port4", 5: "Eth Port5", 6: "Eth Port6",
+        }
+        SUPPRESS_OIDS = set()  # 130.N.1 wordt nu via SCREEN_INFO_PREFIX afgehandeld
+
+        def _decode_varbinds(data: bytes):
+            """Geeft lijst van (oid_str, val_str) terug uit raw SNMP packet."""
+            try:
+                from pysnmp.proto import api as snmp_api
+                from pyasn1.codec.ber import decoder as ber_dec
+                ver = int(snmp_api.decodeMessageVersion(data))
+                p = snmp_api.protoModules[ver]
+                msg, _ = ber_dec.decode(data, asn1Spec=p.Message())
+                pdu = p.apiMessage.getPDU(msg)
+                if ver == 0:
+                    vbs = p.apiTrapPDU.getVarBinds(pdu)
+                else:
+                    vbs = p.apiPDU.getVarBinds(pdu)
+                return [(str(o.prettyPrint()), str(v.prettyPrint())) for o, v in vbs]
+            except Exception as e:
+                return [("decode_error", str(e))]
+
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("0.0.0.0", self.port))
+        except PermissionError:
+            self.trap_received.emit("orange",
+                f"SNMP trap listener: permission denied on port {self.port} (run as admin or use port>1024)",
+                "SYSTEM", "")
+            return
+        except OSError as e:
+            self.trap_received.emit("orange",
+                f"SNMP trap listener: port {self.port} busy or unavailable ({e})", "SYSTEM", "")
+            return
+
+        sock.settimeout(2.0)
+        self.trap_received.emit("green",
+            f"SNMP trap listener active on UDP port {self.port}", "SYSTEM", "")
+
+        # Bijhouden van laatste bekende cabinet-telling per (opt_out, eth_out, cabinet)
+        # Gebruikt om richting (toename=connected / afname=disconnected) te bepalen
+        _cabinet_counts = {}
+        _eth_ports_connected_counts = {}
+        _controller_connected_counts = {}
+
+        while self.running:
+            try:
+                data, addr = sock.recvfrom(65535)
+            except OSError:
+                continue
+
+            src_ip = addr[0]
+            proc_name = ip_names.get(src_ip, src_ip)  # gebruik config-naam ipv hardcoded
+            varbinds = _decode_varbinds(data)
+
+            events = []  # list of (color, msg, oid_str)
+            raw_msgs = []
+            for oid_str, val_str in varbinds:
+                if oid_str in SUPPRESS_OIDS:
+                    continue
+                if oid_str.startswith(CONTROLLER_INFO_PREFIX):
+                    try:
+                        suffix = oid_str[len(CONTROLLER_INFO_PREFIX):]
+                        parts = suffix.split(".")
+                        if len(parts) == 1:
+                            metric = parts[0]
+                            if metric in ("1", "2", "3"):
+                                # Mainboard abnormal: N=1 temp, 2 voltage, 3 fan
+                                val = int(val_str)
+                                label_map = {
+                                    "1": "Mainboard temperature abnormal",
+                                    "2": "Mainboard voltage abnormal",
+                                    "3": "Mainboard fan abnormal",
+                                }
+                                desc = f"{label_map.get(metric, 'Mainboard abnormal')} : {val}"
+                                color = "red" if val > 0 else "green"
+                                severity = "Error" if color == "red" else "Recover"
+                                events.append((color,
+                                    f"{severity},Controller,{proc_name},MX2000 Pro,{src_ip},--,{desc}",
+                                    f"{oid_str}={val_str}"))
+                            elif metric in ("4", "5", "6"):
+                                # Connected card counters: daling of 0 = fout
+                                val = int(val_str)
+                                desc_map = {
+                                    "4": "Input cards connected",
+                                    "5": "Output cards connected",
+                                    "6": "Expansion cards connected",
+                                }
+                                prev = _controller_connected_counts.get(metric)
+                                _controller_connected_counts[metric] = val
+                                color = "red" if (val == 0 or (prev is not None and val < prev)) else "green"
+                                severity = "Error" if color == "red" else "Recover"
+                                desc = f"{desc_map.get(metric, 'Cards connected')} : {val}"
+                                events.append((color,
+                                    f"{severity},Controller,{proc_name},MX2000 Pro,{src_ip},--,{desc}",
+                                    f"{oid_str}={val_str}"))
+                            elif metric == "7":
+                                # Genlock: 0=not connected, 1=connected
+                                gl = int(val_str)
+                                if gl == 0:
+                                    events.append(("red",
+                                        f"Error,Controller,{proc_name},MX2000 Pro,{src_ip},--,Genlock connection status : disconnected",
+                                        f"{oid_str}={val_str}"))
+                                else:
+                                    events.append(("green",
+                                        f"Recover,Controller,{proc_name},MX2000 Pro,{src_ip},--,Genlock connection status : connected",
+                                        f"{oid_str}={val_str}"))
+                            elif metric == "8":
+                                # Informative trap value (string)
+                                events.append(("gray",
+                                    f"Info,Controller,{proc_name},MX2000 Pro,{src_ip},--,SNMP Start Time : {val_str}",
+                                    f"{oid_str}={val_str}"))
+                            else:
+                                raw_msgs.append(f"{oid_str}={val_str}")
+                        else:
+                            raw_msgs.append(f"{oid_str}={val_str}")
+                    except (ValueError, TypeError):
+                        raw_msgs.append(f"{oid_str}={val_str}")
+                    continue
+                if oid_str.startswith(INPUT_CARD_PREFIX):
+                    try:
+                        suffix = oid_str[len(INPUT_CARD_PREFIX):]
+                        parts = suffix.split(".")
+                        val = int(val_str)
+                        # MIB: 110.N.Y  N=input card slot, Y=4 -> #bronnen, Y=1/2/3 -> temp/voltage/fan fout
+                        if len(parts) == 2:
+                            slot = int(parts[0])
+                            metric = parts[1]
+                            if metric == "4":
+                                label = f"Input Card {slot}"
+                                if val == 0:
+                                    events.append(("red",
+                                        f"Error,Controller,{proc_name},MX2000 Pro,{src_ip},--,"
+                                        f"{label} - HDMI Source disconnected (sources: {val})",
+                                        f"{oid_str}={val_str}"))
+                                else:
+                                    events.append(("green",
+                                        f"Recover,Controller,{proc_name},MX2000 Pro,{src_ip},--,"
+                                        f"{label} - HDMI Source connected (sources: {val})",
+                                        f"{oid_str}={val_str}"))
+                            elif metric == "1":
+                                label = f"Input Card {slot}"
+                                color = "red" if val > 0 else "green"
+                                severity = "Error" if color == "red" else "Recover"
+                                events.append((color,
+                                    f"{severity},Controller,{proc_name},MX2000 Pro,{src_ip},--,"
+                                    f"{label} - Temperature abnormal : {val}",
+                                    f"{oid_str}={val_str}"))
+                            elif metric == "2":
+                                label = f"Input Card {slot}"
+                                color = "red" if val > 0 else "green"
+                                severity = "Error" if color == "red" else "Recover"
+                                events.append((color,
+                                    f"{severity},Controller,{proc_name},MX2000 Pro,{src_ip},--,"
+                                    f"{label} - Voltage abnormal : {val}",
+                                    f"{oid_str}={val_str}"))
+                            elif metric == "3":
+                                label = f"Input Card {slot}"
+                                color = "red" if val > 0 else "green"
+                                severity = "Error" if color == "red" else "Recover"
+                                events.append((color,
+                                    f"{severity},Controller,{proc_name},MX2000 Pro,{src_ip},--,"
+                                    f"{label} - Fan abnormal : {val}",
+                                    f"{oid_str}={val_str}"))
+                            else:
+                                raw_msgs.append(f"{oid_str}={val_str}")
+                        else:
+                            raw_msgs.append(f"{oid_str}={val_str}")
+                    except (ValueError, TypeError):
+                        raw_msgs.append(f"{oid_str}={val_str}")
+                    continue
+                if oid_str.startswith(PORT_LINK_PREFIX):
+                    try:
+                        suffix = oid_str[len(PORT_LINK_PREFIX):]
+                        parts = suffix.split(".")
+                        link_val = int(val_str)
+                        # MIB structuur: 1.3.6.1.4.1.319.10.120.N.Y[.metric]
+                        # N = output card slot (=OUT nummer)
+                        # Y = Ethernet port index
+                        # metric: 4=Eth ports connected, 5=recv cards, 6=temp fout, 7=voltage fout
+                        if len(parts) == 3:
+                            slot = int(parts[0])
+                            eth  = int(parts[1])
+                            metric = parts[2]
+                            label = f"OUT{slot}/OPT Port{slot} - Eth Port{eth}"
+                            key = (slot, eth, metric)
+                            prev = _cabinet_counts.get(key)
+                            _cabinet_counts[key] = link_val
+                            if metric == "5":
+                                desc = f"{label} - Receiving cards : {link_val}"
+                                if prev is None:
+                                    # Eerste event zonder baseline: niet stil zijn, toon expliciet alarm.
+                                    events.append(("red",
+                                        f"Error,Controller,{proc_name},MX2000 Pro,{src_ip},--,{desc} (first event, baseline unknown)",
+                                        f"{oid_str}={val_str}"))
+                                else:
+                                    color = "red" if link_val < prev else "green"
+                                    severity = "Error" if color == "red" else "Recover"
+                                    events.append((color,
+                                        f"{severity},Controller,{proc_name},MX2000 Pro,{src_ip},--,{desc}",
+                                        f"{oid_str}={val_str}"))
+                            elif metric == "6":
+                                desc = f"{label} - Receiving cards temp error : {link_val}"
+                                color = "red" if link_val > 0 else "green"
+                                severity = "Error" if color == "red" else "Recover"
+                                events.append((color,
+                                    f"{severity},Controller,{proc_name},MX2000 Pro,{src_ip},--,{desc}",
+                                    f"{oid_str}={val_str}"))
+                            elif metric == "7":
+                                desc = f"{label} - Receiving cards voltage error : {link_val}"
+                                color = "red" if link_val > 0 else "green"
+                                severity = "Error" if color == "red" else "Recover"
+                                events.append((color,
+                                    f"{severity},Controller,{proc_name},MX2000 Pro,{src_ip},--,{desc}",
+                                    f"{oid_str}={val_str}"))
+                            else:
+                                raw_msgs.append(f"{oid_str}={val_str}")
+                        elif len(parts) == 2:
+                            slot = int(parts[0])
+                            if parts[1] == "4":
+                                label = f"OUT{slot}/OPT Port{slot}"
+                                desc = f"{label} - Eth ports connected : {link_val}"
+                                prev = _eth_ports_connected_counts.get(slot)
+                                _eth_ports_connected_counts[slot] = link_val
+                                if prev is None:
+                                    # Eerste event zonder baseline: niet stil zijn, toon expliciet alarm.
+                                    events.append(("red",
+                                        f"Error,Controller,{proc_name},MX2000 Pro,{src_ip},--,{desc} (first event, baseline unknown)",
+                                        f"{oid_str}={val_str}"))
+                                else:
+                                    color = "red" if link_val < prev else "green"
+                                    severity = "Error" if color == "red" else "Recover"
+                                    events.append((color,
+                                        f"{severity},Controller,{proc_name},MX2000 Pro,{src_ip},--,{desc}",
+                                        f"{oid_str}={val_str}"))
+                            else:
+                                raw_msgs.append(f"{oid_str}={val_str}")
+                        else:
+                            raw_msgs.append(f"{oid_str}={val_str}")
+                    except (ValueError, IndexError):
+                        raw_msgs.append(f"{oid_str}={val_str}")
+                    continue
+                if oid_str.startswith(SCREEN_INFO_PREFIX):
+                    try:
+                        suffix = oid_str[len(SCREEN_INFO_PREFIX):]
+                        parts = suffix.split(".")
+                        # MIB: 130.N.1 = recv cards connected, 130.N.2 = temp abnormal, 130.N.3 = voltage abnormal
+                        if len(parts) == 2:
+                            screen = int(parts[0])
+                            metric = parts[1]
+                            val = int(val_str)
+                            label = f"Screen {screen}"
+                            if metric == "1":
+                                prev = _cabinet_counts.get(("screen", screen, 1))
+                                _cabinet_counts[("screen", screen, 1)] = val
+                                desc = f"{label} - Receiving cards connected : {val}"
+                                if prev is None:
+                                    # Eerste event zonder baseline: niet stil zijn, toon expliciet alarm.
+                                    events.append(("red",
+                                        f"Error,Controller,{proc_name},MX2000 Pro,{src_ip},--,{desc} (first event, baseline unknown)",
+                                        f"{oid_str}={val_str}"))
+                                else:
+                                    color = "red" if val < prev else "green"
+                                    severity = "Error" if color == "red" else "Recover"
+                                    events.append((color,
+                                        f"{severity},Controller,{proc_name},MX2000 Pro,{src_ip},--,{desc}",
+                                        f"{oid_str}={val_str}"))
+                            elif metric == "2":
+                                color = "red" if val > 0 else "green"
+                                severity = "Error" if color == "red" else "Recover"
+                                events.append((color,
+                                    f"{severity},Controller,{proc_name},MX2000 Pro,{src_ip},--,"
+                                    f"{label} - Receiving cards temperature abnormal : {val}",
+                                    f"{oid_str}={val_str}"))
+                            elif metric == "3":
+                                color = "red" if val > 0 else "green"
+                                severity = "Error" if color == "red" else "Recover"
+                                events.append((color,
+                                    f"{severity},Controller,{proc_name},MX2000 Pro,{src_ip},--,"
+                                    f"{label} - Receiving cards voltage abnormal : {val}",
+                                    f"{oid_str}={val_str}"))
+                            else:
+                                raw_msgs.append(f"{oid_str}={val_str}")
+                        else:
+                            raw_msgs.append(f"{oid_str}={val_str}")
+                    except (ValueError, TypeError):
+                        raw_msgs.append(f"{oid_str}={val_str}")
+                    continue
+                if oid_str.startswith(MULTIFUNCTION_PREFIX):
+                    try:
+                        suffix = oid_str[len(MULTIFUNCTION_PREFIX):]
+                        parts = suffix.split(".")
+                        # MIB: 30.7.N.1.Y.Z.1.M.1  -> power supply (0=Failed, 1=Normal)
+                        # MIB: 30.7.N.1.Y.Z.2.M.1.1 -> light sensor status (0=Failed, 1=Normal)
+                        # MIB: 30.7.N.1.Y.Z.2.M.1.2 -> light sensor brightness (LUX)
+                        # parts: [N, 1, Y, Z, type, M, 1, ...]
+                        if len(parts) >= 7 and parts[1] == "1":
+                            slot_n = parts[0]
+                            slot_y = parts[2]
+                            slot_z = parts[3]
+                            mf_type = parts[4]
+                            m_idx = parts[5]
+                            label = f"MF Card OUT{slot_n}/Eth{slot_y}/Card{slot_z}"
+                            val = int(val_str)
+                            if mf_type == "1" and len(parts) == 7:
+                                # Power supply: 0=Failed, 1=Normal
+                                if val == 0:
+                                    events.append(("red",
+                                        f"Error,Controller,{proc_name},MX2000 Pro,{src_ip},--,"
+                                        f"{label} - Power supply {m_idx} : Failed",
+                                        f"{oid_str}={val_str}"))
+                                else:
+                                    events.append(("green",
+                                        f"Recover,Controller,{proc_name},MX2000 Pro,{src_ip},--,"
+                                        f"{label} - Power supply {m_idx} : Normal",
+                                        f"{oid_str}={val_str}"))
+                            elif mf_type == "2" and len(parts) == 8:
+                                sub = parts[7]
+                                if sub == "1":
+                                    # Light sensor status: 0=Failed, 1=Normal
+                                    if val == 0:
+                                        events.append(("red",
+                                            f"Error,Controller,{proc_name},MX2000 Pro,{src_ip},--,"
+                                            f"{label} - Light sensor {m_idx} status : Failed",
+                                            f"{oid_str}={val_str}"))
+                                    else:
+                                        events.append(("green",
+                                            f"Recover,Controller,{proc_name},MX2000 Pro,{src_ip},--,"
+                                            f"{label} - Light sensor {m_idx} status : Normal",
+                                            f"{oid_str}={val_str}"))
+                                elif sub == "2":
+                                    # Light sensor brightness in LUX
+                                    events.append(("gray",
+                                        f"Info,Controller,{proc_name},MX2000 Pro,{src_ip},--,"
+                                        f"{label} - Light sensor {m_idx} brightness : {val} LUX",
+                                        f"{oid_str}={val_str}"))
+                                else:
+                                    raw_msgs.append(f"{oid_str}={val_str}")
+                            else:
+                                raw_msgs.append(f"{oid_str}={val_str}")
+                        else:
+                            raw_msgs.append(f"{oid_str}={val_str}")
+                    except (ValueError, TypeError, IndexError):
+                        raw_msgs.append(f"{oid_str}={val_str}")
+                    continue
+                raw_msgs.append(f"{oid_str}={val_str}")
+
+            for color, msg, oid in events:
+                self.trap_received.emit(color, msg, src_ip, oid)
+            # Toon TRAP_RAW alleen als er géén mappable event was (debug/onbekende OIDs)
+            if raw_msgs and not events:
+                self.trap_received.emit("gray", "TRAP_RAW: " + " | ".join(raw_msgs), src_ip,
+                    " | ".join(raw_msgs))
+
+        sock.close()
+
+    def stop(self):
+        self.running = False
+
+
 class MonitorWorker(QThread):
     status_signal = Signal(str, str)
     alert_signal = Signal(str, str, str, dict)  # ip, color, message, receiver_info
@@ -261,7 +1130,11 @@ class MonitorWorker(QThread):
                 if not self.running: break
                 ip = proc.get("ip")
                 name = proc.get("name", "Device")
+                ptype = proc.get("type", "").lower()
                 if not ip: continue
+                # COEX en andere SNMP-gebaseerde devices worden niet via HTTP gemonitord
+                if "coex" in ptype or "novastar" in ptype or "mx" in ptype:
+                    continue
                 try:
                     url = f"http://{ip}/health/alerts"
                     resp = requests.get(url, timeout=1.0)
@@ -411,32 +1284,143 @@ class ScanWorker(QThread):
 
         ips_to_scan = []
         scanned_subnets = []
+        primary_ip = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            primary_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            pass
+
+        # Scan ALLE subnets van alle netwerk-interfaces, niet alleen de internet-facing route.
+        # Dit is nodig als de COEX op een ander subnet zit dan de internet-connectie.
         for local_ip in valid_ips:
             base = ".".join(local_ip.split('.')[:-1])
-            if base in scanned_subnets: continue
+            if base in scanned_subnets:
+                continue
             scanned_subnets.append(base)
-            for i in range(1, 255): ips_to_scan.append(f"{base}.{i}")
+            for i in range(1, 255):
+                ips_to_scan.append(f"{base}.{i}")
 
-        total = len(ips_to_scan)
+        subnets_str = ", ".join(f"{b}.0/24" for b in scanned_subnets)
+        self.log_signal.emit(f"Scanning: {subnets_str}")
+
+        total = max(len(ips_to_scan), 1)
         found_count = 0
-        
+        found_ips = set()
+
+        # FASE 1: HTTP scan (snel, parallel) — alleen Helios
         with ThreadPoolExecutor(max_workers=50) as executor:
-            results = list(executor.map(self.check_ip, ips_to_scan))
+            results = list(executor.map(self.check_ip_http, ips_to_scan))
             for i, result in enumerate(results):
-                self.progress_signal.emit(int((i/total)*100))
+                self.progress_signal.emit(int((i/total)*50))  # tot 50%
                 if result:
                     self.found_signal.emit(result[0], result[1], result[2])
+                    found_ips.add(result[0])
                     found_count += 1
-        
+
+        # FASE 2: SNMP scan (parallel, licht) — voor IPs die niet via HTTP gevonden zijn
+        self.log_signal.emit("SNMP scan voor Novastar COEX...")
+        snmp_engine = self._make_snmp_engine()
+        if snmp_engine is not None:
+            remaining = [ip for ip in ips_to_scan if ip not in found_ips]
+            if remaining:
+                with ThreadPoolExecutor(max_workers=64) as executor:
+                    results = list(executor.map(lambda ip: self.check_ip_snmp(ip, snmp_engine), remaining))
+                    for i, result in enumerate(results):
+                        self.progress_signal.emit(50 + int((i/max(len(remaining),1))*50))
+                        if result:
+                            self.found_signal.emit(result[0], result[1], result[2])
+                            found_count += 1
+
         self.finished_signal.emit(found_count)
 
-    def check_ip(self, ip):
+    def _make_snmp_engine(self):
+        """Probeer pysnmp imports; return dict met api refs of None."""
+        try:
+            import asyncio
+            from pysnmp.hlapi.asyncio import (SnmpEngine, CommunityData, UdpTransportTarget,
+                                              ContextData, ObjectType, ObjectIdentity, getCmd)
+            return {
+                "asyncio": asyncio, "SnmpEngine": SnmpEngine, "CommunityData": CommunityData,
+                "UdpTransportTarget": UdpTransportTarget, "ContextData": ContextData,
+                "ObjectType": ObjectType, "ObjectIdentity": ObjectIdentity, "getCmd": getCmd
+            }
+        except ImportError:
+            return None
+
+    def check_ip_http(self, ip):
         try: 
             if requests.get(f"http://{ip}/health/alerts", timeout=0.8).status_code==200:
                 name = self.fetch_processor_name(ip)
                 return (ip, "Helios", name)
         except: pass
         return None
+
+    def check_ip_snmp(self, ip, S, timeout=0.15):
+        """Snelle SNMP probe op ctrl_model OID. S = engine dict van _make_snmp_engine()."""
+        asyncio = S["asyncio"]
+        try:
+            async def _do():
+                target = S["UdpTransportTarget"]((ip, 161), timeout=timeout, retries=0)
+                errInd, errStat, errIdx, varBinds = await S["getCmd"](
+                    S["SnmpEngine"](), S["CommunityData"]("public", mpModel=1),
+                    target, S["ContextData"](),
+                    S["ObjectType"](S["ObjectIdentity"]("1.3.6.1.4.1.319.10.10.1.2")),  # ctrl_model
+                    S["ObjectType"](S["ObjectIdentity"]("1.3.6.1.4.1.319.10.10.1.4"))   # ctrl_name
+                )
+                if errInd or errStat:
+                    return None
+                model = None
+                ctrl_name = None
+                for vb in varBinds:
+                    oid = vb[0].prettyPrint()
+                    val = vb[1].prettyPrint()
+                    if oid.endswith(".10.10.1.2"):
+                        model = val
+                    elif oid.endswith(".10.10.1.4"):
+                        ctrl_name = val
+                return (model, ctrl_name)
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                result = loop.run_until_complete(_do())
+            finally:
+                # Cancel pending pysnmp dispatcher tasks om 'Task was destroyed' warnings te vermijden
+                try:
+                    pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+                    for t in pending:
+                        t.cancel()
+                    if pending:
+                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    try:
+                        loop.run_until_complete(loop.shutdown_asyncgens())
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                loop.close()
+                try:
+                    asyncio.set_event_loop(None)
+                except Exception:
+                    pass
+            if not result:
+                return None
+            model, ctrl_name = result
+            if not model:
+                return None
+            mu = model.upper()
+            if any(mu.startswith(p) for p in ("MX", "CX", "KU", "VX")):
+                detected_name = (ctrl_name or model or "").strip()
+                return (ip, "Novastar_COEX", detected_name)
+        except Exception:
+            return None
+        return None
+
+    def check_ip(self, ip):
+        # Backwards compat — niet meer gebruikt door run()
+        return self.check_ip_http(ip)
 
     def fetch_processor_name(self, ip):
         try:
@@ -477,6 +1461,12 @@ class ScanWorker(QThread):
 
 # --- GUI CLASSES ---
 
+def display_type_label(ptype):
+    p = str(ptype or "")
+    if p == "Novastar_COEX":
+        return "COEX"
+    return p
+
 class ProcessorCard(QFrame):
     clicked = Signal(str)
     def __init__(self, name, ip, ptype):
@@ -488,7 +1478,7 @@ class ProcessorCard(QFrame):
         self.inner_layout = QVBoxLayout(self.inner_frame); self.inner_layout.setContentsMargins(15, 8, 10, 8); self.inner_layout.setSpacing(2)
         top = QHBoxLayout()
         n = QLabel(str(name)); n.setFont(QFont("Segoe UI", 11, QFont.Bold)); n.setStyleSheet("border:none; background:transparent; color:#fff;")
-        t = QLabel(str(ptype).upper()); t.setFont(QFont("Segoe UI", 8, QFont.Bold)); t.setStyleSheet("border:none; color:#2a82da; background:#111; padding:2px 6px; border-radius:3px;")
+        t = QLabel(display_type_label(ptype).upper()); t.setFont(QFont("Segoe UI", 8, QFont.Bold)); t.setStyleSheet("border:none; color:#2a82da; background:#111; padding:2px 6px; border-radius:3px;")
         top.addWidget(n); top.addStretch(); top.addWidget(t); self.inner_layout.addLayout(top)
         i = QLabel(str(ip)); i.setFont(QFont("Consolas", 9)); i.setStyleSheet("border:none; background:transparent; color:#888;"); self.inner_layout.addWidget(i)
         self.outer_layout.addWidget(self.inner_frame); self.update_style()
@@ -497,19 +1487,21 @@ class ProcessorCard(QFrame):
         if e.button() == Qt.LeftButton: self.clicked.emit(self.ip)
         super().mousePressEvent(e)
 
-    def set_status(self, s, force=False): 
-        if not force and self.status == "error" and s == "ok": return
+    def set_status(self, s, force=False):
+        # offline mag altijd gezet worden (netwerk weg); anders sticky error bewaren
+        if not force and s == "ok" and self.status == "error": return
         self.status = s; self.update_style()
 
     def force_error(self): self.status = "error"; self.update_style()
+    def set_offline(self): self.status = "offline"; self.update_style()
     def set_selected(self, s): self.is_selected = s; self.update_style()
     def set_highlighted(self, highlighted):
         self.is_highlighted = highlighted
         self.update_style()
     def update_style(self):
-        c = "#444"
-        if self.status == "ok": c = "#2ecc71"
-        elif self.status == "error": c = "#e74c3c"
+        c = "#444"  # grijs = offline/onbekend
+        if self.status == "ok": c = "#2ecc71"    # groen
+        elif self.status == "error": c = "#e74c3c"  # rood
         b = "2px solid #2a82da" if self.is_selected else "2px solid transparent"
         if self.is_highlighted:
             bg = "#0a3a6a"
@@ -620,14 +1612,31 @@ class SettingsDialog(QDialog):
     def refresh_list(self):
         self.list_widget.clear()
         for p in self.processors:
-            self.list_widget.addItem(f"{p.get('name')} | {p.get('type')} | {p.get('ip')}")
+            shown_type = display_type_label(p.get('type'))
+            self.list_widget.addItem(f"{p.get('name')} | {shown_type} | {p.get('ip')}")
+
+    def _type_to_display(self, ptype):
+        t = str(ptype or "")
+        if t == "Novastar_COEX":
+            return "COEX"
+        if t.lower() == "helios":
+            return "HELIOS"
+        return t.upper()
+
+    def _display_to_type(self, shown_type):
+        t = str(shown_type or "").upper()
+        if t == "COEX":
+            return "Novastar_COEX"
+        if t == "HELIOS":
+            return "Helios"
+        return t
 
     def on_item_clicked(self, item):
         row = self.list_widget.row(item)
         data = self.processors[row]
         self.inp_name.setText(data.get("name", ""))
         self.inp_ip.setText(data.get("ip", ""))
-        self.inp_type.setCurrentText(data.get("type", "Helios"))
+        self.inp_type.setCurrentText(self._type_to_display(data.get("type", "Helios")))
         self.edit_index = row
         self.lbl_action.setText("Edit Device")
         self.btn_save.setText("UPDATE DEVICE")
@@ -647,7 +1656,7 @@ class SettingsDialog(QDialog):
     def save_device(self):
         name = self.inp_name.text()
         ip = self.inp_ip.text()
-        ptype = self.inp_type.currentText()
+        ptype = self._display_to_type(self.inp_type.currentText())
         if not name or not ip: return
         new_data = {"name": name, "ip": ip, "type": ptype}
         if self.edit_index >= 0: self.processors[self.edit_index] = new_data
@@ -677,18 +1686,27 @@ class SettingsDialog(QDialog):
 
     def on_found(self, ip, ptype, detected_name):
         detected_name = (detected_name or "").strip()
-        fallback_name = f"Helios-{ip.split('.')[-1]}"
+        prefix_map = {"Helios": "Helios", "Novastar_COEX": "COEX", "BROMPTON": "BR", "COLORLIGHT": "CL"}
+        prefix = prefix_map.get(ptype, "DEV")
+        fallback_name = f"{prefix}-{ip.split('.')[-1]}"
 
         existing = next((p for p in self.processors if p.get('ip') == ip), None)
         if existing:
             current_name = str(existing.get('name', '')).strip()
-            if detected_name and (not current_name or current_name.startswith("Helios-")):
+            generic_prefixes = ("Helios-", "COEX-", "BR-", "CL-", "DEV-")
+            if detected_name and (not current_name or current_name.startswith(generic_prefixes)):
                 existing['name'] = detected_name
-                self.refresh_list()
+            # Update type als die nog niet juist was
+            if existing.get('type') != ptype and ptype != "Helios":
+                existing['type'] = ptype
+            self.refresh_list()
             return
 
         name = detected_name or fallback_name
-        self.processors.append({"name": name, "ip": ip, "type": ptype})
+        entry = {"name": name, "ip": ip, "type": ptype}
+        if ptype == "Novastar_COEX":
+            entry["snmp_community"] = "public"
+        self.processors.append(entry)
         self.refresh_list()
 
     def on_scan_finished(self, count):
@@ -709,6 +1727,7 @@ class LEDLoggerApp(QMainWindow):
         self.history_data = load_json(HISTORY_FILE, [])
         self.processors = self.config["processors"]
         self.processor_widgets = {}; self.sockets = {}; self.selected_ip = None; self.log_history = []
+        self.trap_listener = None
         
         # Basis UI setup
         self.setup_ui()
@@ -846,8 +1865,8 @@ class LEDLoggerApp(QMainWindow):
         
         # Live Tab
         self.log_table = QTableWidget()
-        self.log_table.setColumnCount(7)
-        self.log_table.setHorizontalHeaderLabels(["Time", "Device", "MAC", "SFP", "Out", "Pos", "Message"])
+        self.log_table.setColumnCount(8)
+        self.log_table.setHorizontalHeaderLabels(["Time", "Device", "MAC", "OPT", "PORT", "TILE", "Message", "OID"])
         self.log_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.log_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.log_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
@@ -855,6 +1874,8 @@ class LEDLoggerApp(QMainWindow):
         self.log_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.log_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.log_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        self.log_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Interactive)
+        self.log_table.setColumnWidth(7, 280)
         self.log_table.verticalHeader().setVisible(False)
         self.log_table.setSelectionMode(QTableWidget.NoSelection)
         self.log_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -905,10 +1926,151 @@ class LEDLoggerApp(QMainWindow):
         self.sockets = {}
         for p in self.processors:
             ip = p.get("ip")
-            if "helios" in p.get("type", "").lower():
+            ptype = p.get("type", "").lower()
+            if "helios" in ptype:
                 sock = HeliosSocket(ip, p.get("name"), parent=self)
                 sock.error_detected.connect(self.on_socket_error)
                 self.sockets[ip] = sock
+            elif "coex" in ptype or "novastar" in ptype or "mx" in ptype:
+                community = p.get("snmp_community", "public")
+                port_map = p.get("coex_port_map", {})
+                backup_api_enabled = p.get("coex_backup_api_enabled", COEX_BACKUP_API_DEFAULT_ENABLED)
+                backup_api_poll_interval = p.get("coex_backup_api_poll_interval", COEX_BACKUP_API_POLL_INTERVAL_SEC)
+                backup_api_log_every_poll = p.get("coex_backup_api_log_every_poll", COEX_BACKUP_API_DEFAULT_LOG_EVERY_POLL)
+                backup_api_port = p.get("coex_backup_api_port", COEX_BACKUP_API_DEFAULT_PORT)
+                sock = NovastarCoexSocket(
+                    ip,
+                    p.get("name"),
+                    community=community,
+                    port_map=port_map,
+                    api_backup_enabled=backup_api_enabled,
+                    api_backup_poll_interval=backup_api_poll_interval,
+                    api_backup_log_every_poll=backup_api_log_every_poll,
+                    api_backup_port=backup_api_port,
+                    parent=self,
+                )
+                sock.error_detected.connect(self.on_socket_error)
+                self.sockets[ip] = sock
+
+        # Start trap listener één keer (niet per processor)
+        has_coex = any("coex" in p.get("type", "").lower() or "novastar" in p.get("type", "").lower()
+                       for p in self.processors)
+        if has_coex:
+            ip_names = {p['ip']: p.get('name', p['ip'])
+                        for p in self.processors
+                        if p.get('ip') and ("coex" in p.get("type","").lower() or "novastar" in p.get("type","").lower())}
+            if not hasattr(self, "trap_listener") or self.trap_listener is None:
+                self.trap_listener = CoexTrapListener(port=COEX_TRAP_PORT, ip_names=ip_names)
+                self.trap_listener.trap_received.connect(self.on_trap_received)
+                self.trap_listener.start()
+            else:
+                # Namen kunnen gewijzigd zijn in settings/scan; hou listener-map actueel.
+                self.trap_listener.ip_names = ip_names
+
+    def _processor_name_for_ip(self, ip):
+        proc = next((p for p in self.processors if p.get("ip") == ip), None)
+        if proc:
+            name = str(proc.get("name", "")).strip()
+            if name:
+                return name
+        sock = self.sockets.get(ip)
+        if isinstance(sock, NovastarCoexSocket):
+            name = str(getattr(sock, "name", "")).strip()
+            if name:
+                return name
+        return ip
+
+    def _inject_processor_name_in_csv(self, msg, ip):
+        """Vervang het controller-name veld in CSV-achtige logs met de actuele ingestelde naam."""
+        if ",Controller," not in msg:
+            return msg
+        parts = msg.split(",", 6)
+        if len(parts) < 7:
+            return msg
+        if parts[1].strip() != "Controller":
+            return msg
+        parts[2] = self._processor_name_for_ip(ip)
+        parts[4] = "--"
+        return ",".join(parts)
+
+    def _strip_ip_from_controller_csv(self, msg):
+        """Verwijder dubbel IP uit Controller-berichten; het IP staat al in de Device-kolom."""
+        if ",Controller," not in msg:
+            return msg
+        parts = msg.split(",", 6)
+        if len(parts) < 7:
+            return msg
+        if parts[1].strip() != "Controller":
+            return msg
+        severity = parts[0].strip()
+        name = parts[2].strip()
+        desc = parts[6].strip().replace(" : ", ": ")
+        return f"{severity}: {name} - {desc}"
+
+    def _receiver_info_from_coex_trap(self, msg):
+        """Vul SFP/OUT/POS kolommen voor COEX trapregels waar poortinformatie in de beschrijving zit."""
+        if ",Controller," not in msg:
+            return {}
+        parts = msg.split(",", 6)
+        if len(parts) < 7:
+            return {}
+
+        desc = parts[6].strip()
+        info = {"mac": "", "sfp": "", "output": "", "chain_pos": ""}
+
+        # Voorbeeld: OUT1/OPT Port1 - Eth Port5 - Receiving cards : 1
+        if " - Eth Port" in desc and "/OPT Port" in desc:
+            try:
+                left, right = desc.split(" - Eth Port", 1)
+                sfp_part = left.split("/OPT Port", 1)[1]
+                info["sfp"] = sfp_part.strip()
+
+                eth_part, _, value_part = right.partition(" - ")
+                info["output"] = eth_part.strip()
+
+                if " : " in value_part:
+                    tail_value = value_part.rsplit(" : ", 1)[1].strip()
+                    if tail_value.isdigit():
+                        info["chain_pos"] = tail_value
+            except (IndexError, ValueError):
+                return {}
+
+        return {k: v for k, v in info.items() if v}
+
+    def on_trap_received(self, color, msg, ip, oid):
+        """Forward SNMP trap naar de bestaande log."""
+        msg = self._inject_processor_name_in_csv(msg, ip)
+        receiver_info = self._receiver_info_from_coex_trap(msg)
+        self.add_log_entry(color, msg, ip, receiver_info=receiver_info, oid=oid)
+
+        # Update processor balkje op basis van trap-kleur
+        if ip in self.processor_widgets:
+            card = self.processor_widgets[ip]
+            if color == "red":
+                card.force_error()
+            elif color == "green":
+                sock = self.sockets.get(ip)
+                active = getattr(sock, "active_errors", set())
+                if not active:
+                    card.set_status("ok", force=True)
+
+        # Poll backup status als er een ethercon (Eth port/Eth ports) error is
+        if color == "red" and "eth port" in msg.lower():
+            sock = self.sockets.get(ip)
+            if isinstance(sock, NovastarCoexSocket):
+                # Reset flag zodat volgende Eth port error ook pollt
+                sock._backup_poll_on_error_done = False
+                sock._poll_backup_status_api()
+            # Forceer direct extra SNMP check na de trap voor snellere follow-up.
+            QTimer.singleShot(0, sock.poll_health)
+        
+        # Traps bevatten niet altijd volledige context (bijv. HDMI status).
+        # Doe daarom meteen een extra poll op dezelfde COEX, zodat poll-OIDs
+        # (zoals input_src_status) direct ge-evalueerd worden.
+        if msg.startswith("TRAP_RAW:"):
+            sock = self.sockets.get(ip)
+            if isinstance(sock, NovastarCoexSocket):
+                QTimer.singleShot(0, sock.poll_health)
 
     def rebuild_list(self):
         self.device_list.clear()
@@ -949,7 +2111,42 @@ class LEDLoggerApp(QMainWindow):
 
     @Slot(str, str, str)
     def on_socket_error(self, color, msg, ip):
-        if ip in self.processor_widgets: self.processor_widgets[ip].force_error()
+        if ip in self.processor_widgets:
+            card = self.processor_widgets[ip]
+            sock = self.sockets.get(ip)
+            is_unreachable = "unreachable" in msg.lower() or "SNMP unreachable" in msg
+            if is_unreachable:
+                # Geen netwerk → grijs (overschrijft ook sticky error)
+                card.set_offline()
+            elif color == "green":
+                # Online/Recover: groen zetten tenzij er nog actieve errors zijn
+                active = getattr(sock, "active_errors", set())
+                if not active:
+                    card.set_status("ok", force=True)
+                else:
+                    card.force_error()  # er zijn nog open errors
+            elif color == "red":
+                card.force_error()
+            elif color == "orange":
+                # Warning: alleen uit offline halen, niet naar rood
+                if card.status == "offline":
+                    card.set_status("ok", force=True)
+            elif color == "gray":
+                # Informatieve melding, status niet aanpassen
+                pass
+        # Update webserver status op basis van de actuele kaartstatus (ook sticky).
+        if ip in LogWebServer.device_statuses:
+            card = self.processor_widgets.get(ip)
+            if card is not None:
+                if card.status == "error":
+                    LogWebServer.device_statuses[ip] = "error"
+                elif card.status == "ok":
+                    LogWebServer.device_statuses[ip] = "ok"
+            else:
+                if color == "green":
+                    LogWebServer.device_statuses[ip] = "ok"
+                elif color == "red":
+                    LogWebServer.device_statuses[ip] = "error"
         self.add_log_entry(color, msg, ip)
 
     @Slot(str, str, str, str)
@@ -963,13 +2160,15 @@ class LEDLoggerApp(QMainWindow):
         for p_ip, card in self.processor_widgets.items(): card.set_selected(p_ip == self.selected_ip)
         self.refresh_log_display()
 
-    def add_log_entry(self, color, msg, ip, receiver_info=None):
+    def add_log_entry(self, color, msg, ip, receiver_info=None, oid=""):
+        msg = self._strip_ip_from_controller_csv(msg)
         entry = {
             "time": datetime.now().strftime("%H:%M:%S"),
             "color": color,
             "msg": msg,
             "ip": ip,
-            "receiver_info": receiver_info if receiver_info else {}
+            "receiver_info": receiver_info if receiver_info else {},
+            "oid": oid
         }
         self.log_history.append(entry)
         if self.selected_ip is None or self.selected_ip == ip or ip == "SYSTEM": 
@@ -1043,6 +2242,12 @@ class LEDLoggerApp(QMainWindow):
         msg_item = QTableWidgetItem(entry["msg"])
         msg_item.setForeground(c)
         self.log_table.setItem(row, 6, msg_item)
+
+        # OID
+        oid_text = entry.get("oid", "")
+        oid_item = QTableWidgetItem(oid_text)
+        oid_item.setForeground(QColor("#666666") if not oid_text else QColor("#aaaaaa"))
+        self.log_table.setItem(row, 7, oid_item)
         
         self.log_table.scrollToBottom()
 
