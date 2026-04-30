@@ -1621,7 +1621,7 @@ class SettingsDialog(QDialog):
         right.addWidget(self.lbl_action)
         self.inp_name = QLineEdit(); self.inp_name.setPlaceholderText("Name")
         self.inp_ip = QLineEdit(); self.inp_ip.setPlaceholderText("IP Address")
-        self.inp_type = QComboBox(); self.inp_type.addItems(["HELIOS", "COEX", "BROMPTON", "COLORLIGHT"])
+        self.inp_type = QComboBox(); self.inp_type.addItems(["HELIOS", "COEX"])
         
         right.addWidget(QLabel("Name:"))
         right.addWidget(self.inp_name)
@@ -1767,7 +1767,7 @@ class SettingsDialog(QDialog):
 
     def on_found(self, ip, ptype, detected_name):
         detected_name = (detected_name or "").strip()
-        prefix_map = {"Helios": "Helios", "Novastar_COEX": "COEX", "BROMPTON": "BR", "COLORLIGHT": "CL"}
+        prefix_map = {"Helios": "Helios", "Novastar_COEX": "COEX"}
         prefix = prefix_map.get(ptype, "DEV")
         fallback_name = f"{prefix}-{ip.split('.')[-1]}"
 
