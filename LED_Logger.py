@@ -4,6 +4,9 @@ import time
 import json
 import socket
 import traceback
+import base64
+import hashlib
+import hmac
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -35,6 +38,12 @@ VERSION = "1.1.0-beta"
 LOGO_FILE = "logo.ico"  # <--- HIER ZAT DE FOUT (ontbrekend aanhalingsteken)
 CONFIG_FILE = "config.json"
 HISTORY_FILE = "history.json"
+WEB_DEFAULT_USERNAME = "admin"
+WEB_DEFAULT_PASSWORD = "1234"
+
+
+def hash_password(password):
+    return hashlib.sha256(str(password).encode("utf-8")).hexdigest()
 
 def resource_path(relative_path):
     """Geeft het juiste pad terug, of we nu vanuit .py of vanuit een PyInstaller .exe draaien."""
@@ -71,8 +80,41 @@ class LogWebServer(BaseHTTPRequestHandler):
     log_data = []  
     device_statuses = {}  # Nieuw: houdt status per IP bij
     last_clear_time = 0  # Track wanneer laatste clear was
+    auth_username = WEB_DEFAULT_USERNAME
+    auth_password_hash = hash_password(WEB_DEFAULT_PASSWORD)
+
+    @classmethod
+    def configure_auth(cls, username, password_hash):
+        cls.auth_username = str(username or WEB_DEFAULT_USERNAME).strip() or WEB_DEFAULT_USERNAME
+        cls.auth_password_hash = str(password_hash or hash_password(WEB_DEFAULT_PASSWORD))
+
+    def _is_authorized(self):
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Basic "):
+            return False
+        try:
+            raw = base64.b64decode(auth.split(" ", 1)[1].strip()).decode("utf-8")
+            if ":" not in raw:
+                return False
+            username, password = raw.split(":", 1)
+            if username != self.auth_username:
+                return False
+            return hmac.compare_digest(hash_password(password), self.auth_password_hash)
+        except Exception:
+            return False
+
+    def _send_auth_required(self):
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="LED Logger Remote Monitor"')
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"Authentication required")
 
     def do_GET(self):
+        if not self._is_authorized():
+            self._send_auth_required()
+            return
+
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.end_headers()
@@ -1535,11 +1577,14 @@ class ProcessorCard(QFrame):
         self.inner_frame.setStyleSheet(f"#InnerCard {{ background: {bg}; border-left: {border}; border-radius: 3px; }}")
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent=None, current_processors=[]):
+    def __init__(self, parent=None, current_processors=[], current_web_auth=None):
         super().__init__(parent)
         self.setWindowTitle("Configure Processors")
         self.resize(950, 600)
         self.processors = list(current_processors)
+        auth_data = current_web_auth if isinstance(current_web_auth, dict) else {}
+        self.current_web_username = str(auth_data.get("username", WEB_DEFAULT_USERNAME)).strip() or WEB_DEFAULT_USERNAME
+        self.current_web_password_hash = str(auth_data.get("password_hash", hash_password(WEB_DEFAULT_PASSWORD)))
         self.edit_index = -1 
         
         self.setStyleSheet("QDialog { background-color: #121212; } QLabel { color: #eaeaea; font-family: 'Segoe UI'; } QLineEdit, QComboBox { background-color: #1e1e1e; border: 1px solid #333; border-radius: 5px; padding: 10px; color: #fff; } QListWidget { background-color: #1e1e1e; border: 1px solid #333; border-radius: 5px; color: #ddd; } QPushButton { background-color: #333; color: white; border-radius: 5px; padding: 10px; border: none; } QProgressBar { border: none; background-color: #111; height: 4px; } QProgressBar::chunk { background-color: #2a82da; }")
@@ -1619,6 +1664,20 @@ class SettingsDialog(QDialog):
         
         self.scan_lbl = QLabel("Ready."); self.scan_lbl.setStyleSheet("color: #666; font-style: italic;")
         right.addWidget(self.scan_lbl)
+
+        line_auth = QFrame(); line_auth.setFrameShape(QFrame.HLine); line_auth.setStyleSheet("color: #333;")
+        right.addWidget(line_auth)
+        right.addWidget(QLabel("Web Interface Login", styleSheet="font-weight: bold; color: #aaa; margin-top: 10px;"))
+
+        self.inp_web_user = QLineEdit(); self.inp_web_user.setPlaceholderText("Username")
+        self.inp_web_user.setText(self.current_web_username)
+        self.inp_web_pass = QLineEdit(); self.inp_web_pass.setEchoMode(QLineEdit.Password)
+        self.inp_web_pass.setPlaceholderText("New password (leave empty to keep current)")
+
+        right.addWidget(QLabel("Username:"))
+        right.addWidget(self.inp_web_user)
+        right.addWidget(QLabel("Password:"))
+        right.addWidget(self.inp_web_pass)
         right.addStretch()
         split.addLayout(right, 55)
         main.addLayout(split)
@@ -1740,12 +1799,21 @@ class SettingsDialog(QDialog):
     def get_processors(self):
         return self.processors
 
+    def get_web_auth(self):
+        username = self.inp_web_user.text().strip() or WEB_DEFAULT_USERNAME
+        password = self.inp_web_pass.text()
+        password_hash = self.current_web_password_hash
+        if password:
+            password_hash = hash_password(password)
+        return {"username": username, "password_hash": password_hash}
+
 # --- MAIN APP ---
 
 class LEDLoggerApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.config = load_json(CONFIG_FILE, {"processors": []})
+        self._ensure_web_auth_config()
         self.history_data = load_json(HISTORY_FILE, [])
         self.processors = self.config["processors"]
         self.processor_widgets = {}; self.sockets = {}; self.coex_threads = {}; self.selected_ip = None; self.log_history = []
@@ -1757,6 +1825,7 @@ class LEDLoggerApp(QMainWindow):
         # Initialiseer data voor webserver
         LogWebServer.log_data = self.log_history
         LogWebServer.device_statuses = {p['ip']: "offline" for p in self.processors if 'ip' in p}
+        self._apply_web_auth()
         
         # --- WEB SERVER SETUP (Main Thread safe) ---
         port = 8090
@@ -1807,6 +1876,33 @@ class LEDLoggerApp(QMainWindow):
             print(f"[WEBSERVER ERROR] Onverwachte fout bij starten webserver: {e}")
             import traceback
             traceback.print_exc()
+
+    def _ensure_web_auth_config(self):
+        web_auth = self.config.get("web_auth")
+        changed = False
+        if not isinstance(web_auth, dict):
+            web_auth = {}
+            changed = True
+
+        username = str(web_auth.get("username", "")).strip()
+        if not username:
+            web_auth["username"] = WEB_DEFAULT_USERNAME
+            changed = True
+
+        if not web_auth.get("password_hash"):
+            web_auth["password_hash"] = hash_password(WEB_DEFAULT_PASSWORD)
+            changed = True
+
+        self.config["web_auth"] = web_auth
+        if changed:
+            save_config(self.config)
+
+    def _apply_web_auth(self):
+        web_auth = self.config.get("web_auth", {})
+        LogWebServer.configure_auth(
+            web_auth.get("username", WEB_DEFAULT_USERNAME),
+            web_auth.get("password_hash", hash_password(WEB_DEFAULT_PASSWORD)),
+        )
 
     def set_remote_monitor_url(self, url):
         self.remote_monitor_url = url
@@ -2365,11 +2461,13 @@ class LEDLoggerApp(QMainWindow):
             self.history_detail.clear()
 
     def open_settings(self):
-        dlg = SettingsDialog(self, self.processors)
+        dlg = SettingsDialog(self, self.processors, self.config.get("web_auth", {}))
         if dlg.exec():
             old_processors = self.processors
             self.processors = dlg.get_processors(); self.config["processors"] = self.processors
+            self.config["web_auth"] = dlg.get_web_auth()
             save_config(self.config); self.http_worker.update_processors(self.processors)
+            self._apply_web_auth()
             self.http_worker.force_scan()  # Immediate scan!
             self.init_sockets(); self.rebuild_list()
             if old_processors != self.processors:
