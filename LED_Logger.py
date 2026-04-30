@@ -1535,7 +1535,7 @@ class ProcessorCard(QFrame):
     clicked = Signal(str)
     def __init__(self, name, ip, ptype):
         super().__init__()
-        self.ip = ip; self.name = name; self.ptype = ptype; self.status = "offline"; self.is_selected = False; self.is_highlighted = False
+        self.ip = ip; self.name = name; self.ptype = ptype; self.status = "offline"; self.had_error = False; self.is_selected = False; self.is_highlighted = False
         self.setObjectName("ProcCard"); self.setFixedHeight(85); self.setCursor(Qt.PointingHandCursor)
         self.outer_layout = QVBoxLayout(self); self.outer_layout.setContentsMargins(2, 2, 2, 2); self.outer_layout.setSpacing(0)
         self.inner_frame = QFrame(); self.inner_frame.setObjectName("InnerCard")
@@ -1553,11 +1553,12 @@ class ProcessorCard(QFrame):
 
     def set_status(self, s, force=False):
         # offline mag altijd gezet worden (netwerk weg); anders sticky error bewaren
-        if not force and s == "ok" and self.status == "error": return
+        if not force and s == "ok" and self.had_error: return
         self.status = s; self.update_style()
 
-    def force_error(self): self.status = "error"; self.update_style()
+    def force_error(self): self.had_error = True; self.status = "error"; self.update_style()
     def set_offline(self): self.status = "offline"; self.update_style()
+    def reset_error(self): self.had_error = False; self.status = "ok"; self.update_style()
     def set_selected(self, s): self.is_selected = s; self.update_style()
     def set_highlighted(self, highlighted):
         self.is_highlighted = highlighted
@@ -2197,7 +2198,7 @@ class LEDLoggerApp(QMainWindow):
                 sock = self.sockets.get(ip)
                 active = getattr(sock, "active_errors", set())
                 if not active:
-                    card.set_status("ok", force=True)
+                    card.set_status("ok")
 
         # Poll backup status als er een ethercon (Eth port/Eth ports) error is
         if color == "red" and "eth port" in msg.lower():
@@ -2263,7 +2264,7 @@ class LEDLoggerApp(QMainWindow):
                 # Online/Recover: groen zetten tenzij er nog actieve errors zijn
                 active = getattr(sock, "active_errors", set())
                 if not active:
-                    card.set_status("ok", force=True)
+                    card.set_status("ok")
                 else:
                     card.force_error()  # er zijn nog open errors
             elif color == "red":
@@ -2271,7 +2272,7 @@ class LEDLoggerApp(QMainWindow):
             elif color == "orange":
                 # Warning: alleen uit offline halen, niet naar rood
                 if card.status == "offline":
-                    card.set_status("ok", force=True)
+                    card.set_status("ok")
             elif color == "gray":
                 # Informatieve melding, status niet aanpassen
                 pass
@@ -2434,7 +2435,7 @@ class LEDLoggerApp(QMainWindow):
             sock.active_errors.clear()
             
         for card in self.processor_widgets.values(): 
-            card.set_status("ok", force=True)
+            card.reset_error()
 
     def reload_history_tab(self):
         self.history_tree.clear()
