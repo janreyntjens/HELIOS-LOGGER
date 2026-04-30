@@ -563,7 +563,7 @@ class NovastarCoexSocket(QObject):
         elif target_is_set:
             self.trap_server_configured = True
             self.error_detected.emit("green",
-                f"{self.name}: Trap target al correct ingesteld -> {target} (via device/VMP)", self.ip)
+                f"{self.name}: Trap target al aanwezig op device -> {target}", self.ip)
         else:
             # Markeer als 'configured' om herhaalde foutmeldingen te voorkomen.
             self.trap_server_configured = True
@@ -678,7 +678,7 @@ class NovastarCoexSocket(QObject):
             except ValueError:
                 pass
 
-        # 4. HDMI input source status
+        # 4. Input source status
         src_val, src_err = self._snmp_get(COEX_OIDS["input_src_status"])
         if src_err is None and src_val is not None:
             try:
@@ -687,7 +687,7 @@ class NovastarCoexSocket(QObject):
                 prev_state = self._eth_port_bits.get(src_key)
                 self._eth_port_bits[src_key] = src_state
                 if prev_state is not None and src_state != prev_state:
-                    in_label = "HDMI Source"
+                    in_label = "Input Source"
                     if src_state == 0:
                         self.error_detected.emit("red",
                             f"Error,Controller,{self._ctrl_name},{self._ctrl_model},{self.ip},--,{in_label}: Source disconnected",
@@ -874,12 +874,12 @@ class CoexTrapListener(QThread):
                                 if val == 0:
                                     events.append(("red",
                                         f"Error,Controller,{proc_name},MX2000 Pro,{src_ip},--,"
-                                        f"{label} - HDMI Source disconnected (sources: {val})",
+                                        f"{label} - Input Source disconnected (sources: {val})",
                                         f"{oid_str}={val_str}"))
                                 else:
                                     events.append(("green",
                                         f"Recover,Controller,{proc_name},MX2000 Pro,{src_ip},--,"
-                                        f"{label} - HDMI Source connected (sources: {val})",
+                                        f"{label} - Input Source connected (sources: {val})",
                                         f"{oid_str}={val_str}"))
                             elif metric == "1":
                                 label = f"Input Card {slot}"
