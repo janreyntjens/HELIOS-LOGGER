@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LED Logger - User Manual</title>
+  <style>
+    :root {
+      --bg: #0f1218;
+      --panel: #161c26;
+      --panel-2: #1d2634;
+      --text: #e9eef8;
+      --muted: #a9b4c8;
+      --accent: #36a3ff;
+      --accent-2: #4ee0c5;
+      --ok: #38c172;
+      --warn: #ffb020;
+      --err: #ff5a5a;
+      --line: #2b3546;
+      --code: #0c1017;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(900px 400px at 90% -10%, rgba(54, 163, 255, 0.25), transparent 70%),
+        radial-gradient(700px 350px at -10% 0%, rgba(78, 224, 197, 0.18), transparent 70%),
+        var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", "Trebuchet MS", Verdana, sans-serif;
+      line-height: 1.55;
+      min-height: 100vh;
+    }
+
+    .wrap {
+      max-width: 1000px;
+      margin: 32px auto;
+      padding: 0 18px 40px;
+    }
+
+    .hero {
+      background: linear-gradient(145deg, rgba(29, 38, 52, 0.95), rgba(22, 28, 38, 0.95));
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 26px;
+      box-shadow: 0 16px 45px rgba(0, 0, 0, 0.32);
+      margin-bottom: 20px;
+    }
+
+    .title {
+      margin: 0;
+      font-size: 2rem;
+      letter-spacing: 0.2px;
+    }
+
+    .subtitle {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 1rem;
+    }
+
+    .pill-row {
+      margin-top: 14px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .pill {
+      background: rgba(54, 163, 255, 0.13);
+      border: 1px solid rgba(54, 163, 255, 0.35);
+      color: #d9ebff;
+      border-radius: 999px;
+      padding: 7px 12px;
+      font-size: 0.88rem;
+      white-space: nowrap;
+    }
+
+    .section {
+      background: rgba(22, 28, 38, 0.9);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 18px 20px;
+      margin-top: 14px;
+    }
+
+    h2 {
+      margin: 0 0 10px;
+      font-size: 1.2rem;
+      color: #f5f9ff;
+    }
+
+    h3 {
+      margin: 16px 0 8px;
+      font-size: 1rem;
+      color: #d8ecff;
+    }
+
+    p {
+      margin: 8px 0;
+      color: var(--text);
+    }
+
+    ul,
+    ol {
+      margin: 6px 0 10px 20px;
+    }
+
+    li {
+      margin: 4px 0;
+      color: var(--text);
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 8px;
+    }
+
+    .card {
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 12px;
+    }
+
+    .status {
+      font-weight: 600;
+    }
+
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .err { color: var(--err); }
+
+    pre {
+      margin: 8px 0;
+      background: var(--code);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 12px;
+      overflow: auto;
+      color: #d2dcf0;
+      font-size: 0.9rem;
+    }
+
+    code {
+      font-family: Consolas, "Courier New", monospace;
+    }
+
+    .foot {
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 0.9rem;
+      text-align: center;
+    }
+
+    @media (max-width: 760px) {
+      .wrap {
+        margin-top: 18px;
+      }
+
+      .hero,
+      .section {
+        padding: 16px;
+      }
+
+      .title {
+        font-size: 1.5rem;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="hero">
+      <h1 class="title">LED Logger - User Manual</h1>
+      <p class="subtitle">Operator guide for the Windows executable build.</p>
+      <div class="pill-row">
+        <span class="pill">Helios via WebSocket/API</span>
+        <span class="pill">Novastar COEX via SNMP + Traps</span>
+        <span class="pill">Remote Monitor (TCP 8090)</span>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>1. Package Contents</h2>
+      <ul>
+        <li>Required: <code>LED_Logger.exe</code></li>
+        <li>Required: <code>config.json</code> (or <code>config.example.json</code> as template)</li>
+        <li>Auto-created: <code>history.json</code> (saved sessions)</li>
+      </ul>
+      <p class="muted">Keep these files in the same folder.</p>
+    </section>
+
+    <section class="section">
+      <h2>2. System Requirements</h2>
+      <ul>
+        <li>Windows 10/11</li>
+        <li>Network access to LED processors</li>
+        <li>Firewall rules for:
+          <ul>
+            <li>TCP 8090 (remote monitor page)</li>
+            <li>UDP 10162 (COEX SNMP traps)</li>
+            <li>UDP 161 outbound (COEX SNMP polling)</li>
+          </ul>
+        </li>
+      </ul>
+    </section>
+
+    <section class="section">
+      <h2>3. First Start</h2>
+      <ol>
+        <li>Launch <code>LED_Logger.exe</code>.</li>
+        <li>If no devices exist, Device Management opens automatically.</li>
+        <li>Add devices manually or run <strong>SCAN NETWORK</strong>.</li>
+        <li>Click <strong>SAVE and CLOSE</strong>.</li>
+        <li>Watch events in <strong>LIVE MONITOR</strong>.</li>
+      </ol>
+    </section>
+
+    <section class="section">
+      <h2>4. Device Types</h2>
+      <ul>
+        <li><code>Helios</code></li>
+        <li><code>Novastar_COEX</code></li>
+      </ul>
+      <p class="muted">UI labels are typically HELIOS and COEX.</p>
+    </section>
+
+    <section class="section">
+      <h2>5. Configuration Example</h2>
+      <pre><code>{
+  "processors": [
+    {
+      "name": "Main Helios",
+      "ip": "192.168.1.10",
+      "type": "Helios"
+    },
+    {
+      "name": "MX2000 Main",
+      "ip": "192.168.1.20",
+      "type": "Novastar_COEX",
+      "snmp_community": "public"
+    }
+  ],
+  "web_auth": {
+    "username": "admin",
+    "password_hash": "03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4"
+  }
+}</code></pre>
+
+      <h3>Important Fields</h3>
+      <ul>
+        <li><code>name</code>: shown in UI and logs</li>
+        <li><code>ip</code>: processor IP address</li>
+        <li><code>type</code>: Helios or Novastar_COEX</li>
+      </ul>
+
+      <h3>COEX Optional Fields</h3>
+      <ul>
+        <li><code>snmp_community</code> (usually public)</li>
+        <li><code>coex_backup_api_enabled</code></li>
+        <li><code>coex_backup_api_port</code> (default 8001)</li>
+        <li><code>coex_backup_api_poll_interval</code></li>
+        <li><code>coex_backup_api_log_every_poll</code></li>
+      </ul>
+
+      <p class="muted">Default web login is admin / 1234 until changed in settings.</p>
+    </section>
+
+    <section class="section">
+      <h2>6. App Workflow</h2>
+      <h3>LIVE MONITOR Columns</h3>
+      <ul>
+        <li>Time, Device, MAC, OPT, PORT, TILE, Message, OID</li>
+      </ul>
+
+      <h3>Color Meaning</h3>
+      <div class="grid">
+        <div class="card"><span class="status err">Red</span>: error / fault</div>
+        <div class="card"><span class="status warn">Orange</span>: warning</div>
+        <div class="card"><span class="status ok">Green</span>: recover / OK</div>
+        <div class="card"><span class="status">Gray</span>: info / system</div>
+      </div>
+
+      <h3>History and Baselines</h3>
+      <ul>
+        <li><strong>CLEAR LOG / SAVE SESSION</strong> stores current session into <code>history.json</code>.</li>
+        <li>A fresh baseline starts immediately after clearing.</li>
+      </ul>
+    </section>
+
+    <section class="section">
+      <h2>7. Remote Monitor Webpage</h2>
+      <p>The app starts a webserver on port 8090 and shows the URL in the sidebar.</p>
+      <p>Example: <code>http://192.168.0.50:8090</code></p>
+      <ul>
+        <li>Basic Auth protected</li>
+        <li>Auto-refresh enabled</li>
+        <li>Shows latest logs and global device status</li>
+      </ul>
+      <p>To change credentials: <strong>CONFIGURE DEVICES</strong> &gt; <strong>Web Interface Login</strong>.</p>
+    </section>
+
+    <section class="section">
+      <h2>8. COEX SNMP Traps and Auto-Config</h2>
+      <ul>
+        <li>Health polling over SNMP</li>
+        <li>Trap listener on UDP 10162</li>
+      </ul>
+      <p>On first online detection, the app attempts to auto-configure trap target settings on the COEX device.</p>
+      <p class="muted">If this fails due to firmware limitations or SNMP write permissions, a manual VMP instruction is logged.</p>
+    </section>
+
+    <section class="section">
+      <h2>9. Troubleshooting Checklist</h2>
+      <h3>No remote monitor page</h3>
+      <ul>
+        <li>Check if port 8090 is free.</li>
+        <li>Try <code>http://localhost:8090</code> on the logger PC.</li>
+        <li>Verify firewall permissions.</li>
+      </ul>
+
+      <h3>COEX stays offline</h3>
+      <ul>
+        <li>Ping the controller.</li>
+        <li>Check SNMP community value.</li>
+        <li>Ensure SNMP is enabled on the device.</li>
+      </ul>
+
+      <h3>No trap events</h3>
+      <ul>
+        <li>Allow UDP 10162 inbound on the logger PC.</li>
+        <li>Verify trap target in VMP.</li>
+      </ul>
+    </section>
+
+    <section class="section">
+      <h2>10. Developer Notes (Optional)</h2>
+      <p>Run from source:</p>
+      <pre><code>pip install -r requirements.txt
+python LED_Logger.py</code></pre>
+      <p>Build executable:</p>
+      <pre><code>pyinstaller LED_Logger.spec</code></pre>
+    </section>
+
+    <p class="foot">LED Logger manual generated for distribution with the executable package.</p>
+  </main>
+</body>
+</html>
