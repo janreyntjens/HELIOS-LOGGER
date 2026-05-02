@@ -37,8 +37,13 @@ except ImportError as e:
 APP_NAME = "LED Logger"
 VERSION = "1.1.0-beta"
 LOGO_FILE = "logo.ico"  # <--- HIER ZAT DE FOUT (ontbrekend aanhalingsteken)
-CONFIG_FILE = "config.json"
-HISTORY_FILE = "history.json"
+if getattr(sys, "frozen", False):
+    APP_BASE_DIR = os.path.dirname(sys.executable)
+else:
+    APP_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+CONFIG_FILE = os.path.join(APP_BASE_DIR, "config.json")
+HISTORY_FILE = os.path.join(APP_BASE_DIR, "history.json")
 WEB_DEFAULT_USERNAME = "admin"
 WEB_DEFAULT_PASSWORD = "1234"
 
@@ -89,6 +94,10 @@ class LogWebServer(BaseHTTPRequestHandler):
         cls.auth_username = str(username or WEB_DEFAULT_USERNAME).strip() or WEB_DEFAULT_USERNAME
         cls.auth_password_hash = str(password_hash or hash_password(WEB_DEFAULT_PASSWORD))
 
+    def log_message(self, format, *args):
+        # In windowed .exe builds stderr may be unavailable; suppress default handler logging.
+        return
+
     def _is_authorized(self):
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Basic "):
@@ -112,82 +121,98 @@ class LogWebServer(BaseHTTPRequestHandler):
         self.wfile.write(b"Authentication required")
 
     def do_GET(self):
-        if not self._is_authorized():
-            self._send_auth_required()
-            return
+        try:
+            if not self._is_authorized():
+                self._send_auth_required()
+                return
 
-        self.send_response(200)
-        self.send_header("Content-type", "text/html")
-        self.end_headers()
-        
-        # Bereken statistieken
-        total = len(self.device_statuses)
-        online = sum(1 for s in self.device_statuses.values() if s in ["ok", "error"])
-        status_color = "#2ecc71" if online == total and total > 0 else "#f1c40f" if online > 0 else "#e74c3c"
-        
-        # Snellere refresh direct na een clear
-        refresh_interval = 2 if (time.time() - self.last_clear_time) < 10 else 5
+            self.send_response(200)
+            self.send_header("Content-type", "text/html; charset=utf-8")
+            self.end_headers()
 
-        html = f"""
-        <html>
-        <head>
-            <title>{APP_NAME} Remote Monitor</title>
-            <meta http-equiv="refresh" content="{refresh_interval}">
-            <style>
-                body {{ background-color: #0f0f0f; color: #ececec; font-family: 'Segoe UI', sans-serif; padding: 30px; margin: 0; }}
-                
-                /* Custom Dark Scrollbar */
-                ::-webkit-scrollbar {{ width: 12px; }}
-                ::-webkit-scrollbar-track {{ background: #1a1a1a; }}
-                ::-webkit-scrollbar-thumb {{ background: #333; border-radius: 6px; border: 3px solid #1a1a1a; }}
+            # Bereken statistieken
+            total = len(self.device_statuses)
+            online = sum(1 for s in self.device_statuses.values() if s in ["ok", "error"])
+            status_color = "#2ecc71" if online == total and total > 0 else "#f1c40f" if online > 0 else "#e74c3c"
 
-                .header {{ 
-                    display: flex; 
-                    justify-content: space-between; 
-                    align-items: center; 
-                    border-bottom: 2px solid #2a82da; 
-                    padding-bottom: 15px; 
-                    margin-bottom: 20px;
-                }}
+            # Snellere refresh direct na een clear
+            refresh_interval = 2 if (time.time() - self.last_clear_time) < 10 else 5
 
-                h2 {{ color: #2a82da; margin: 0; letter-spacing: 1px; }}
+            html = f"""
+            <html>
+            <head>
+                <title>{APP_NAME} Remote Monitor</title>
+                <meta http-equiv="refresh" content="{refresh_interval}">
+                <style>
+                    body {{ background-color: #0f0f0f; color: #ececec; font-family: 'Segoe UI', sans-serif; padding: 30px; margin: 0; }}
 
-                /* Status Indicator Style */
-                .status-bar {{
-                    background: #181818;
-                    padding: 10px 20px;
-                    border-radius: 20px;
-                    border: 1px solid #333;
-                    font-weight: bold;
-                    display: flex;
-                    align-items: center;
-                    gap: 10px;
-                }}
-                .dot {{ height: 12px; width: 12px; background-color: {status_color}; border-radius: 50%; display: inline-block; }}
+                    /* Custom Dark Scrollbar */
+                    ::-webkit-scrollbar {{ width: 12px; }}
+                    ::-webkit-scrollbar-track {{ background: #1a1a1a; }}
+                    ::-webkit-scrollbar-thumb {{ background: #333; border-radius: 6px; border: 3px solid #1a1a1a; }}
 
-                .entry {{ padding: 8px 12px; background: #181818; border-radius: 4px; margin-bottom: 4px; border-left: 4px solid #333; font-family: 'Consolas', monospace; }}
-                .time {{ color: #666; font-size: 12px; margin-right: 10px; }}
-                .red {{ border-left-color: #e74c3c; color: #ff6b6b; font-weight: bold; }}
-                .green {{ border-left-color: #2ecc71; color: #2ecc71; }}
-                .system {{ border-left-color: #2a82da; color: #2a82da; font-style: italic; }}
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <h2>{APP_NAME} Live LOG</h2>
-                <div class="status-bar">
-                    <span class="dot"></span>
-                    SYSTEM ONLINE: {online} / {total} DEVICES
+                    .header {{
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: center;
+                        border-bottom: 2px solid #2a82da;
+                        padding-bottom: 15px;
+                        margin-bottom: 20px;
+                    }}
+
+                    h2 {{ color: #2a82da; margin: 0; letter-spacing: 1px; }}
+
+                    /* Status Indicator Style */
+                    .status-bar {{
+                        background: #181818;
+                        padding: 10px 20px;
+                        border-radius: 20px;
+                        border: 1px solid #333;
+                        font-weight: bold;
+                        display: flex;
+                        align-items: center;
+                        gap: 10px;
+                    }}
+                    .dot {{ height: 12px; width: 12px; background-color: {status_color}; border-radius: 50%; display: inline-block; }}
+
+                    .entry {{ padding: 8px 12px; background: #181818; border-radius: 4px; margin-bottom: 4px; border-left: 4px solid #333; font-family: 'Consolas', monospace; }}
+                    .time {{ color: #666; font-size: 12px; margin-right: 10px; }}
+                    .red {{ border-left-color: #e74c3c; color: #ff6b6b; font-weight: bold; }}
+                    .green {{ border-left-color: #2ecc71; color: #2ecc71; }}
+                    .system {{ border-left-color: #2a82da; color: #2a82da; font-style: italic; }}
+                </style>
+            </head>
+            <body>
+                <div class="header">
+                    <h2>{APP_NAME} Live LOG</h2>
+                    <div class="status-bar">
+                        <span class="dot"></span>
+                        SYSTEM ONLINE: {online} / {total} DEVICES
+                    </div>
                 </div>
-            </div>
-            <div id="logs">
-        """
-        for entry in reversed(self.log_data[-100:]):
-            color_class = "system" if entry.get("ip") == "SYSTEM" else entry.get("color", "gray")
-            html += f'<div class="entry {color_class}"><span class="time">[{entry["time"]}]</span> {entry["msg"]}</div>'
-            
-        html += "</div></body></html>"
-        self.wfile.write(html.encode("utf-8"))
+                <div id="logs">
+            """
+            for entry in reversed(self.log_data[-100:]):
+                try:
+                    if not isinstance(entry, dict):
+                        continue
+                    color_class = "system" if entry.get("ip") == "SYSTEM" else entry.get("color", "gray")
+                    ts = str(entry.get("time", "--:--:--"))
+                    msg = str(entry.get("msg", ""))
+                    html += f'<div class="entry {color_class}"><span class="time">[{ts}]</span> {msg}</div>'
+                except Exception:
+                    continue
+
+            html += "</div></body></html>"
+            self.wfile.write(html.encode("utf-8"))
+        except Exception as e:
+            try:
+                self.send_response(500)
+                self.send_header("Content-type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(f"Remote monitor error: {e}".encode("utf-8", errors="replace"))
+            except Exception:
+                pass
 
 def severity_to_color(severity):
     """Map Helios severity levels to log colors."""
@@ -1957,6 +1982,14 @@ class LEDLoggerApp(QMainWindow):
         bind_candidates = ["0.0.0.0"]
         if configured_bind_ip:
             bind_candidates = [configured_bind_ip, "0.0.0.0"]
+        bind_candidates.append("127.0.0.1")
+
+        # Unieke volgorde behouden
+        unique_candidates = []
+        for b in bind_candidates:
+            if b not in unique_candidates:
+                unique_candidates.append(b)
+        bind_candidates = unique_candidates
 
         local_ip = configured_bind_ip if configured_bind_ip else self._detect_local_ip()
         preferred_ports = (8090, 8091, 8092, 8093, 8094)
@@ -1977,6 +2010,8 @@ class LEDLoggerApp(QMainWindow):
                     self.add_log_entry("green", f"REMOTE MONITOR ACTIVE: {url}", "SYSTEM")
                     if configured_bind_ip and bind_ip == "0.0.0.0":
                         self.add_log_entry("orange", f"Configured bind IP {configured_bind_ip} unavailable; fallback to all adapters.", "SYSTEM")
+                    if bind_ip == "127.0.0.1":
+                        self.add_log_entry("orange", "Webserver draait enkel lokaal (127.0.0.1). Controleer firewall/adapterkeuze voor externe toegang.", "SYSTEM")
                     self.web_thread = threading.Thread(target=self.web_server.serve_forever, daemon=True)
                     self.web_thread.start()
                     return True
