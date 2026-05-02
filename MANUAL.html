@@ -199,90 +199,27 @@
       <h2>1. Package Contents</h2>
       <ul>
         <li>Required: <code>LED_Logger.exe</code></li>
-        <li>Required: <code>config.json</code> (or <code>config.example.json</code> as template)</li>
+        <li>Optional at first start: <code>config.json</code> (auto-created if missing)</li>
+        <li>Optional template: <code>config.example.json</code> (copy/rename to <code>config.json</code> if you want to prefill devices)</li>
         <li>Auto-created: <code>history.json</code> (saved sessions)</li>
       </ul>
       <p class="muted">Keep these files in the same folder.</p>
     </section>
 
     <section class="section">
-      <h2>2. System Requirements</h2>
-      <ul>
-        <li>Windows 10/11</li>
-        <li>Network access to LED processors</li>
-        <li>Firewall rules for:
-          <ul>
-            <li>TCP 8090 (remote monitor page)</li>
-            <li>UDP 10162 (COEX SNMP traps)</li>
-            <li>UDP 161 outbound (COEX SNMP polling)</li>
-          </ul>
-        </li>
-      </ul>
-    </section>
-
-    <section class="section">
-      <h2>3. First Start</h2>
+      <h2>2. Quick Start (30 seconds)</h2>
       <ol>
-        <li>Launch <code>LED_Logger.exe</code>.</li>
-        <li>If no devices exist, Device Management opens automatically.</li>
-        <li>Add devices manually or run <strong>SCAN NETWORK</strong>.</li>
+        <li>Start <code>LED_Logger.exe</code>.</li>
+        <li>Open <strong>CONFIGURE DEVICES</strong> (opens automatically on first launch).</li>
+        <li>Add your processors (or use <strong>SCAN NETWORK</strong>).</li>
         <li>Click <strong>SAVE and CLOSE</strong>.</li>
-        <li>Watch events in <strong>LIVE MONITOR</strong>.</li>
+        <li>Open the shown web link (for example <code>http://localhost:8090</code>) if you want remote monitor view.</li>
       </ol>
+      <p class="muted">That is enough to start logging.</p>
     </section>
 
     <section class="section">
-      <h2>4. Device Types</h2>
-      <ul>
-        <li><code>Helios</code></li>
-        <li><code>Novastar_COEX</code></li>
-      </ul>
-      <p class="muted">UI labels are typically HELIOS and COEX.</p>
-    </section>
-
-    <section class="section">
-      <h2>5. Configuration Example</h2>
-      <pre><code>{
-  "processors": [
-    {
-      "name": "Main Helios",
-      "ip": "192.168.1.10",
-      "type": "Helios"
-    },
-    {
-      "name": "MX2000 Main",
-      "ip": "192.168.1.20",
-      "type": "Novastar_COEX",
-      "snmp_community": "public"
-    }
-  ],
-  "web_auth": {
-    "username": "admin",
-    "password_hash": "03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4"
-  }
-}</code></pre>
-
-      <h3>Important Fields</h3>
-      <ul>
-        <li><code>name</code>: shown in UI and logs</li>
-        <li><code>ip</code>: processor IP address</li>
-        <li><code>type</code>: Helios or Novastar_COEX</li>
-      </ul>
-
-      <h3>COEX Optional Fields</h3>
-      <ul>
-        <li><code>snmp_community</code> (usually public)</li>
-        <li><code>coex_backup_api_enabled</code></li>
-        <li><code>coex_backup_api_port</code> (default 8001)</li>
-        <li><code>coex_backup_api_poll_interval</code></li>
-        <li><code>coex_backup_api_log_every_poll</code></li>
-      </ul>
-
-      <p class="muted">Default web login is admin / 1234 until changed in settings.</p>
-    </section>
-
-    <section class="section">
-      <h2>6. App Workflow</h2>
+      <h2>3. Daily Use</h2>
       <h3>LIVE MONITOR Columns</h3>
       <ul>
         <li>Time, Device, MAC, OPT, PORT, TILE, Message, OID</li>
@@ -304,7 +241,7 @@
     </section>
 
     <section class="section">
-      <h2>7. Remote Monitor Webpage</h2>
+      <h2>4. Remote Monitor</h2>
       <p>The app starts a webserver on port 8090 and shows the URL in the sidebar.</p>
       <p>Example: <code>http://192.168.0.50:8090</code></p>
       <ul>
@@ -313,20 +250,11 @@
         <li>Shows latest logs and global device status</li>
       </ul>
       <p>To change credentials: <strong>CONFIGURE DEVICES</strong> &gt; <strong>Web Interface Login</strong>.</p>
+      <p class="muted">If login is never set, default is admin / 1234.</p>
     </section>
 
     <section class="section">
-      <h2>8. COEX SNMP Traps and Auto-Config</h2>
-      <ul>
-        <li>Health polling over SNMP</li>
-        <li>Trap listener on UDP 10162</li>
-      </ul>
-      <p>On first online detection, the app attempts to auto-configure trap target settings on the COEX device.</p>
-      <p class="muted">If this fails due to firmware limitations or SNMP write permissions, a manual VMP instruction is logged.</p>
-    </section>
-
-    <section class="section">
-      <h2>9. Troubleshooting Checklist</h2>
+      <h2>5. Troubleshooting</h2>
       <h3>No remote monitor page</h3>
       <ul>
         <li>Check if port 8090 is free.</li>
@@ -344,20 +272,11 @@
       <h3>No trap events</h3>
       <ul>
         <li>Allow UDP 10162 inbound on the logger PC.</li>
-        <li>Verify trap target in VMP.</li>
+        <li>Verify trap target settings in NovaStar VMP software.</li>
       </ul>
     </section>
 
-    <section class="section">
-      <h2>10. Developer Notes (Optional)</h2>
-      <p>Run from source:</p>
-      <pre><code>pip install -r requirements.txt
-python LED_Logger.py</code></pre>
-      <p>Build executable:</p>
-      <pre><code>pyinstaller LED_Logger.spec</code></pre>
-    </section>
-
-    <p class="foot">LED Logger manual generated for distribution with the executable package.</p>
+    <p class="foot">Operator manual for LED Logger executable package.</p>
   </main>
 </body>
 </html>
