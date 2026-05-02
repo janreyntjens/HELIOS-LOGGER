@@ -1742,7 +1742,7 @@ class SettingsDialog(QDialog):
         self.cmb_bind_ip.setCurrentIndex(selected_index)
         right.addWidget(self.cmb_bind_ip)
 
-        bind_hint = QLabel("Tip: kies hier je Wi-Fi adapter om in de venue via dat netwerk de logs te bekijken.")
+        bind_hint = QLabel("Tip: select your Wi-Fi adapter here to view logs from anywhere in the venue.")
         bind_hint.setStyleSheet("color: #666; font-style: italic;")
         right.addWidget(bind_hint)
         right.addStretch()
