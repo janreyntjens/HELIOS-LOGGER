@@ -7,6 +7,7 @@ import traceback
 import base64
 import hashlib
 import hmac
+import ipaddress
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,7 +27,7 @@ try:
     from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer, QUrl, QObject, QMetaObject
     from PySide6.QtGui import QPalette, QColor, QIcon, QFont
     from PySide6.QtWebSockets import QWebSocket
-    from PySide6.QtNetwork import QAbstractSocket 
+    from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
 except ImportError as e:
     import ctypes
     ctypes.windll.user32.MessageBoxW(0, f"Error: {e}\nRun: pip install PySide6 requests", "Startup Error", 0x10)
@@ -1579,14 +1580,16 @@ class ProcessorCard(QFrame):
         self.inner_frame.setStyleSheet(f"#InnerCard {{ background: {bg}; border-left: {border}; border-radius: 3px; }}")
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent=None, current_processors=[], current_web_auth=None):
+    def __init__(self, parent=None, current_processors=[], current_web_auth=None, current_web_server=None):
         super().__init__(parent)
         self.setWindowTitle("Configure Processors")
         self.resize(950, 600)
         self.processors = list(current_processors)
         auth_data = current_web_auth if isinstance(current_web_auth, dict) else {}
+        web_server_data = current_web_server if isinstance(current_web_server, dict) else {}
         self.current_web_username = str(auth_data.get("username", WEB_DEFAULT_USERNAME)).strip() or WEB_DEFAULT_USERNAME
         self.current_web_password_hash = str(auth_data.get("password_hash", hash_password(WEB_DEFAULT_PASSWORD)))
+        self.current_bind_ip = str(web_server_data.get("bind_ip", "")).strip()
         self.edit_index = -1 
         
         self.setStyleSheet("QDialog { background-color: #121212; } QLabel { color: #eaeaea; font-family: 'Segoe UI'; } QLineEdit, QComboBox { background-color: #1e1e1e; border: 1px solid #333; border-radius: 5px; padding: 10px; color: #fff; } QListWidget { background-color: #1e1e1e; border: 1px solid #333; border-radius: 5px; color: #ddd; } QPushButton { background-color: #333; color: white; border-radius: 5px; padding: 10px; border: none; } QProgressBar { border: none; background-color: #111; height: 4px; } QProgressBar::chunk { background-color: #2a82da; }")
@@ -1680,6 +1683,43 @@ class SettingsDialog(QDialog):
         right.addWidget(self.inp_web_user)
         right.addWidget(QLabel("Password:"))
         right.addWidget(self.inp_web_pass)
+
+        right.addWidget(QLabel("Webserver Adapter/IP:"))
+        self.cmb_bind_ip = QComboBox()
+        self.cmb_bind_ip.addItem("AUTO (best match)", "")
+        selected_index = 0
+        seen_ips = set()
+        for iface in QNetworkInterface.allInterfaces():
+            flags = iface.flags()
+            if not (flags & QNetworkInterface.IsUp):
+                continue
+            if flags & QNetworkInterface.IsLoopBack:
+                continue
+            name = iface.humanReadableName() or iface.name()
+            for entry in iface.addressEntries():
+                ip = entry.ip().toString()
+                if "." not in ip:
+                    continue
+                if ip.startswith("127.") or ip.startswith("169.254."):
+                    continue
+                if ip in seen_ips:
+                    continue
+                seen_ips.add(ip)
+                idx = self.cmb_bind_ip.count()
+                self.cmb_bind_ip.addItem(f"{name} ({ip})", ip)
+                if self.current_bind_ip and ip == self.current_bind_ip:
+                    selected_index = idx
+
+        if self.current_bind_ip and selected_index == 0:
+            self.cmb_bind_ip.addItem(f"Configured IP ({self.current_bind_ip})", self.current_bind_ip)
+            selected_index = self.cmb_bind_ip.count() - 1
+
+        self.cmb_bind_ip.setCurrentIndex(selected_index)
+        right.addWidget(self.cmb_bind_ip)
+
+        bind_hint = QLabel("Tip: kies hier je Wi-Fi adapter om in de venue via dat netwerk de logs te bekijken.")
+        bind_hint.setStyleSheet("color: #666; font-style: italic;")
+        right.addWidget(bind_hint)
         right.addStretch()
         split.addLayout(right, 55)
         main.addLayout(split)
@@ -1809,6 +1849,10 @@ class SettingsDialog(QDialog):
             password_hash = hash_password(password)
         return {"username": username, "password_hash": password_hash}
 
+    def get_web_server_settings(self):
+        bind_ip = str(self.cmb_bind_ip.currentData() or "").strip()
+        return {"bind_ip": bind_ip}
+
 # --- MAIN APP ---
 
 class LEDLoggerApp(QMainWindow):
@@ -1816,6 +1860,7 @@ class LEDLoggerApp(QMainWindow):
         super().__init__()
         self.config = load_json(CONFIG_FILE, {"processors": []})
         self._ensure_web_auth_config()
+        self._ensure_web_server_config()
         self.history_data = load_json(HISTORY_FILE, [])
         self.processors = self.config["processors"]
         self.processor_widgets = {}; self.sockets = {}; self.coex_threads = {}; self.selected_ip = None; self.log_history = []
@@ -1845,6 +1890,21 @@ class LEDLoggerApp(QMainWindow):
             QTimer.singleShot(500, self.open_settings)
 
     def _detect_local_ip(self):
+        # Prefer the interface actually used to reach configured processors.
+        for p in self.processors:
+            target_ip = str(p.get("ip", "")).strip()
+            if not target_ip:
+                continue
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect((target_ip, 1))
+                local_ip = s.getsockname()[0]
+                s.close()
+                if local_ip and local_ip != "0.0.0.0" and not local_ip.startswith("127."):
+                    return local_ip
+            except Exception:
+                continue
+
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
@@ -1852,6 +1912,33 @@ class LEDLoggerApp(QMainWindow):
             s.close()
             if local_ip and local_ip != "0.0.0.0":
                 return local_ip
+        except Exception:
+            pass
+
+        # Hostname can map to multiple adapters; prefer private, non-loopback IPv4.
+        try:
+            candidates = set()
+            for entry in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                ip = entry[4][0]
+                if ip and not ip.startswith("127."):
+                    candidates.add(ip)
+
+            private_candidates = []
+            public_candidates = []
+            for ip in candidates:
+                try:
+                    addr = ipaddress.ip_address(ip)
+                    if addr.is_private:
+                        private_candidates.append(ip)
+                    else:
+                        public_candidates.append(ip)
+                except ValueError:
+                    continue
+
+            if private_candidates:
+                return sorted(private_candidates)[0]
+            if public_candidates:
+                return sorted(public_candidates)[0]
         except Exception:
             pass
 
@@ -1866,22 +1953,35 @@ class LEDLoggerApp(QMainWindow):
 
     def start_web_server(self):
         """Start de remote monitor server en geef duidelijke status in de GUI."""
-        local_ip = self._detect_local_ip()
+        configured_bind_ip = str(self.config.get("web_server", {}).get("bind_ip", "")).strip()
+        bind_candidates = ["0.0.0.0"]
+        if configured_bind_ip:
+            bind_candidates = [configured_bind_ip, "0.0.0.0"]
+
+        local_ip = configured_bind_ip if configured_bind_ip else self._detect_local_ip()
         preferred_ports = (8090, 8091, 8092, 8093, 8094)
         last_error = None
 
-        for port in preferred_ports:
-            try:
-                self.web_server = ThreadingHTTPServer(("0.0.0.0", port), LogWebServer)
-                url = f"http://{local_ip}:{port}"
-                self.setWindowTitle(f"{APP_NAME} - {VERSION} | Remote Log: {url}")
-                self.set_remote_monitor_url(url)
-                self.add_log_entry("green", f"REMOTE MONITOR ACTIVE: {url}", "SYSTEM")
-                self.web_thread = threading.Thread(target=self.web_server.serve_forever, daemon=True)
-                self.web_thread.start()
-                return True
-            except OSError as e:
-                last_error = e
+        for bind_ip in bind_candidates:
+            for port in preferred_ports:
+                try:
+                    self.web_server = ThreadingHTTPServer((bind_ip, port), LogWebServer)
+                    advert_ip = local_ip
+                    if bind_ip != "0.0.0.0":
+                        advert_ip = bind_ip
+                    elif not advert_ip:
+                        advert_ip = self._detect_local_ip()
+                    url = f"http://{advert_ip}:{port}"
+                    self.setWindowTitle(f"{APP_NAME} - {VERSION} | Remote Log: {url}")
+                    self.set_remote_monitor_url(url)
+                    self.add_log_entry("green", f"REMOTE MONITOR ACTIVE: {url}", "SYSTEM")
+                    if configured_bind_ip and bind_ip == "0.0.0.0":
+                        self.add_log_entry("orange", f"Configured bind IP {configured_bind_ip} unavailable; fallback to all adapters.", "SYSTEM")
+                    self.web_thread = threading.Thread(target=self.web_server.serve_forever, daemon=True)
+                    self.web_thread.start()
+                    return True
+                except OSError as e:
+                    last_error = e
 
         self.remote_monitor_url = ""
         self.setWindowTitle(f"{APP_NAME} - {VERSION} | Remote Log: unavailable")
@@ -1891,6 +1991,22 @@ class LEDLoggerApp(QMainWindow):
         err_txt = str(last_error) if last_error else "unknown startup error"
         self.add_log_entry("red", f"REMOTE MONITOR FAILED: {err_txt}", "SYSTEM")
         return False
+
+    def restart_web_server(self):
+        if self.web_server is not None:
+            try:
+                self.web_server.shutdown()
+                self.web_server.server_close()
+            except Exception:
+                pass
+        if self.web_thread is not None and self.web_thread.is_alive():
+            try:
+                self.web_thread.join(timeout=1.2)
+            except Exception:
+                pass
+        self.web_server = None
+        self.web_thread = None
+        return self.start_web_server()
 
     def _ensure_web_auth_config(self):
         web_auth = self.config.get("web_auth")
@@ -1909,6 +2025,26 @@ class LEDLoggerApp(QMainWindow):
             changed = True
 
         self.config["web_auth"] = web_auth
+        if changed:
+            save_config(self.config)
+
+    def _ensure_web_server_config(self):
+        web_server = self.config.get("web_server")
+        changed = False
+        if not isinstance(web_server, dict):
+            web_server = {}
+            changed = True
+
+        bind_ip = str(web_server.get("bind_ip", "")).strip()
+        if web_server.get("bind_ip", "") != bind_ip:
+            web_server["bind_ip"] = bind_ip
+            changed = True
+
+        if "bind_ip" not in web_server:
+            web_server["bind_ip"] = ""
+            changed = True
+
+        self.config["web_server"] = web_server
         if changed:
             save_config(self.config)
 
@@ -2476,13 +2612,20 @@ class LEDLoggerApp(QMainWindow):
             self.history_detail.clear()
 
     def open_settings(self):
-        dlg = SettingsDialog(self, self.processors, self.config.get("web_auth", {}))
+        dlg = SettingsDialog(
+            self,
+            self.processors,
+            self.config.get("web_auth", {}),
+            self.config.get("web_server", {}),
+        )
         if dlg.exec():
             old_processors = self.processors
             self.processors = dlg.get_processors(); self.config["processors"] = self.processors
             self.config["web_auth"] = dlg.get_web_auth()
+            self.config["web_server"] = dlg.get_web_server_settings()
             save_config(self.config); self.http_worker.update_processors(self.processors)
             self._apply_web_auth()
+            self.restart_web_server()
             self.http_worker.force_scan()  # Immediate scan!
             self.init_sockets(); self.rebuild_list()
             if old_processors != self.processors:
