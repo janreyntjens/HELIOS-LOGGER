@@ -18,6 +18,7 @@ import threading
 # --- GEKORRIGEERDE IMPORT (Regel 16 t/m 25) ---
 try:
     import requests
+    import urllib3
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
         QFrame, QLabel, QPushButton, QTextEdit, QMessageBox, QDialog,
@@ -33,6 +34,8 @@ except ImportError as e:
     import ctypes
     ctypes.windll.user32.MessageBoxW(0, f"Error: {e}\nRun: pip install PySide6 requests", "Startup Error", 0x10)
     sys.exit(1)
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- CONSTANTEN ---
 APP_NAME = "LED Logger"
@@ -250,14 +253,17 @@ def severity_to_color(severity):
 class HeliosSocket(QObject):
     error_detected = Signal(str, str, str)
 
-    def __init__(self, ip, name, parent=None):
+    def __init__(self, ip, name, ws_path="/api/v1/data/rpc/websocket", parent=None):
         super().__init__(parent)
         self.ip = ip.strip()
         self.name = name
         self.active_errors = set()
         
         self.ws = QWebSocket()
-        self.url = f"ws://{self.ip}/api/v1/data/rpc/websocket"
+        path = str(ws_path or "/api/v1/data/rpc/websocket").strip()
+        if not path.startswith("/"):
+            path = "/" + path
+        self.url = f"ws://{self.ip}{path}"
         self.ws.textMessageReceived.connect(self.on_message)
         
         self.retry_timer = QTimer(self)
@@ -310,6 +316,234 @@ class HeliosSocket(QObject):
     def stop(self):
         self.retry_timer.stop()
         self.ws.close()
+
+
+BROMPTON_POLL_INTERVAL_SEC = 3
+
+
+class BromptonSocket(QObject):
+    """HTTP API monitor voor Brompton Tessera processors."""
+    error_detected = Signal(str, str, str)  # color, message, ip
+
+    def __init__(self, ip, name, poll_interval=BROMPTON_POLL_INTERVAL_SEC, parent=None):
+        super().__init__(parent)
+        self.ip = ip.strip()
+        self.name = name
+        self.base_url = f"http://{self.ip}/api"
+        self.last_seen_ok = False
+        self._state = {}
+        self.active_errors = set()
+        self.poll_timer = None
+
+        try:
+            self.poll_interval_sec = max(2, int(poll_interval))
+        except (TypeError, ValueError):
+            self.poll_interval_sec = BROMPTON_POLL_INTERVAL_SEC
+
+        # Sommige Tessera setups antwoorden op HTTPS of geven non-JSON payloads terug.
+        self.base_urls = [f"http://{self.ip}/api", f"https://{self.ip}/api"]
+
+    @Slot()
+    def start_polling(self):
+        if self.poll_timer is not None:
+            return
+        self.poll_timer = QTimer()
+        self.poll_timer.setInterval(self.poll_interval_sec * 1000)
+        self.poll_timer.timeout.connect(self.poll_health)
+        QTimer.singleShot(150, self.poll_health)
+        self.poll_timer.start()
+
+    def _api_get(self, path, timeout=1.0):
+        """Return (reachable, value, status_code, used_url)."""
+        for base in self.base_urls:
+            url = f"{base}/{path}"
+            try:
+                resp = requests.get(url, timeout=timeout, verify=False)
+            except Exception:
+                continue
+
+            status = int(resp.status_code)
+
+            # Device reageert wel; ook bij auth/404 blijven we dit als reachable zien.
+            if status in (401, 403, 404):
+                return True, None, status, url
+
+            if status != 200:
+                continue
+
+            if not resp.content:
+                return True, {}, status, url
+
+            # JSON indien mogelijk, anders plain text teruggeven.
+            try:
+                return True, resp.json(), status, url
+            except Exception:
+                txt = (resp.text or "").strip()
+                return True, txt, status, url
+
+        return False, None, None, None
+
+    def _first_scalar(self, payload, preferred_key=None):
+        if isinstance(payload, (int, float, str, bool)):
+            return payload
+        if isinstance(payload, dict):
+            if preferred_key and preferred_key in payload:
+                return payload.get(preferred_key)
+            # Negeer typische response wrapper velden en pak eerste scalar waarde.
+            for k, v in payload.items():
+                if k in ("response-code", "response", "status"):
+                    continue
+                if isinstance(v, (int, float, str, bool)):
+                    return v
+            for v in payload.values():
+                if isinstance(v, (int, float, str, bool)):
+                    return v
+        return None
+
+    def _to_number_or_text(self, value):
+        if value is None:
+            return None
+        if isinstance(value, (int, float, bool)):
+            return value
+        if isinstance(value, str):
+            v = value.strip()
+            if not v:
+                return None
+            try:
+                if "." in v:
+                    return float(v)
+                return int(v)
+            except (ValueError, TypeError):
+                return v
+        return value
+
+    def _to_int(self, value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _to_bool(self, value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(int(value))
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in ("true", "1", "on", "enabled", "active", "ok"):
+                return True
+            if v in ("false", "0", "off", "disabled", "inactive", "failed"):
+                return False
+        return None
+
+    @Slot()
+    def poll_health(self):
+        endpoints = {
+            "software_version": ("system/software/version", "version"),
+            "error_count": ("devices/statistics/error-count", "error-count"),
+            "online_count": ("devices/statistics/online-count", "online-count"),
+            "fan_case_1": ("system/fan/case/one/status", "status"),
+            "fan_case_2": ("system/fan/case/two/status", "status"),
+            "fan_fpga": ("system/fan/fpga/status", "status"),
+        }
+
+        failed = 0
+        reachable_hits = 0
+        auth_limited = False
+        current = {}
+        for key, (path, preferred_key) in endpoints.items():
+            try:
+                reachable, payload, status, _used_url = self._api_get(path)
+                if not reachable:
+                    failed += 1
+                    continue
+                reachable_hits += 1
+                if status in (401, 403):
+                    auth_limited = True
+                    current[key] = None
+                    continue
+                scalar = self._first_scalar(payload, preferred_key=preferred_key)
+                current[key] = self._to_number_or_text(scalar)
+            except Exception:
+                failed += 1
+
+        if reachable_hits == 0:
+            if not self.last_seen_ok:
+                return
+            self.last_seen_ok = False
+            self.error_detected.emit("red", f"{self.name}: BROMPTON API unreachable", self.ip)
+            return
+
+        if not self.last_seen_ok:
+            self.last_seen_ok = True
+            self.error_detected.emit("green", f"{self.name}: BROMPTON API online", self.ip)
+
+        if auth_limited:
+            self.error_detected.emit(
+                "orange",
+                f"Warning,Controller,{self.name},BROMPTON,{self.ip},--,API requires authentication for some endpoints",
+                self.ip,
+            )
+
+        prev_error_count = self._to_int(self._state.get("error_count"))
+        curr_error_count = self._to_int(current.get("error_count"))
+        if curr_error_count is not None and curr_error_count != prev_error_count:
+            if curr_error_count > 0:
+                severity = "Error"
+                color = "red"
+            else:
+                severity = "Recover"
+                color = "green"
+            self.error_detected.emit(
+                color,
+                f"{severity},Controller,{self.name},BROMPTON,{self.ip},--,Devices reporting error: {curr_error_count}",
+                self.ip,
+            )
+
+        prev_online_count = self._to_int(self._state.get("online_count"))
+        curr_online_count = self._to_int(current.get("online_count"))
+        if (
+            curr_online_count is not None
+            and prev_online_count is not None
+            and curr_online_count != prev_online_count
+        ):
+            self.error_detected.emit(
+                "gray",
+                f"Info,Controller,{self.name},BROMPTON,{self.ip},--,Devices online count: {curr_online_count}",
+                self.ip,
+            )
+
+        fan_labels = {
+            "fan_case_1": "Case fan 1",
+            "fan_case_2": "Case fan 2",
+            "fan_fpga": "FPGA fan",
+        }
+        for fan_key, fan_label in fan_labels.items():
+            prev = self._to_bool(self._state.get(fan_key))
+            curr = self._to_bool(current.get(fan_key))
+            if curr is None or curr == prev:
+                continue
+            err_id = f"fan:{fan_key}"
+            if curr:
+                self.active_errors.discard(err_id)
+                self.error_detected.emit(
+                    "green",
+                    f"Recover,Controller,{self.name},BROMPTON,{self.ip},--,{fan_label} status: normal",
+                    self.ip,
+                )
+            else:
+                self.active_errors.add(err_id)
+                self.error_detected.emit(
+                    "red",
+                    f"Error,Controller,{self.name},BROMPTON,{self.ip},--,{fan_label} status: failed",
+                    self.ip,
+                )
+
+        self._state.update(current)
+
+    def stop(self):
+        if self.poll_timer is not None:
+            self.poll_timer.stop()
 
 # ==========================================
 #   NOVASTAR COEX (MX2000 Pro / MX40 Pro / MX6000 Pro / ...)
@@ -648,6 +882,9 @@ class NovastarCoexSocket(QObject):
         ok2, err2 = self._snmp_set("1.3.6.1.4.1.319.10.200.2", 0, "Integer")
         # Trap On (OID: 1.3.6.1.4.1.319.10.200.4, Integer 1=On)
         ok3, err3 = self._snmp_set("1.3.6.1.4.1.319.10.200.4", 1, "Integer")
+        # Trap Mode (OID: 1.3.6.1.4.1.319.10.200.5, Integer 1=Complex)
+        # Complex mode is nodig voor detail-events (bijv. kabel los per scherm/poort).
+        ok4, err4 = self._snmp_set("1.3.6.1.4.1.319.10.200.5", 1, "Integer")
 
         # Lees actuele trap target terug om vals-negatieve melding te voorkomen.
         current_target, read_err = self._snmp_get("1.3.6.1.4.1.319.10.200.1")
@@ -671,6 +908,8 @@ class NovastarCoexSocket(QObject):
                 details.append(f"200.2={err2}")
             if err3:
                 details.append(f"200.4={err3}")
+            if err4:
+                details.append(f"200.5={err4}")
             if read_err:
                 details.append(f"readback={read_err}")
             detail_txt = f" | details: {'; '.join(details)}" if details else ""
@@ -838,6 +1077,15 @@ class CoexTrapListener(QThread):
         CONTROLLER_INFO_PREFIX = "1.3.6.1.4.1.319.10.100."
         SCREEN_INFO_PREFIX     = "1.3.6.1.4.1.319.10.130."
         MULTIFUNCTION_PREFIX   = "1.3.6.1.4.1.319.10.30.7."
+        MONITOR_STATUS_OID     = COEX_OIDS["monitor_status"]
+        MX40_ALT_PREFIX_MAP = {
+            "1.3.6.1.4.1.319.10.10.120.": PORT_LINK_PREFIX,
+            "1.3.6.1.4.1.319.10.10.110.": INPUT_CARD_PREFIX,
+            "1.3.6.1.4.1.319.10.10.100.": CONTROLLER_INFO_PREFIX,
+            "1.3.6.1.4.1.319.10.10.130.": SCREEN_INFO_PREFIX,
+        }
+        MX40_TEMP_HOTSPOT_OID = "1.3.6.1.4.1.319.10.10.30.6.1.3.1.1"
+        MX40_METRIC_PREFIX = "1.3.6.1.4.1.319.10.10.70."
         ip_names = self.ip_names  # {ip: config_naam}
         # Poortnamen zoals VMP ze toont (1-3 OPT, 4-6 Eth met globaal poortnummer)
         PORT_NAMES = {
@@ -886,6 +1134,9 @@ class CoexTrapListener(QThread):
         _cabinet_counts = {}
         _eth_ports_connected_counts = {}
         _controller_connected_counts = {}
+        _monitor_status_by_ip = {}
+        _mx40_hotspot_state = {}
+        _mx40_metric_state = {}
 
         while self.running:
             try:
@@ -902,9 +1153,95 @@ class CoexTrapListener(QThread):
             for oid_str, val_str in varbinds:
                 if oid_str in SUPPRESS_OIDS:
                     continue
-                if oid_str.startswith(CONTROLLER_INFO_PREFIX):
+
+                # MX40 hotspot payload (JSON). Log alleen bij wijziging om minuut-spam te vermijden.
+                if oid_str == MX40_TEMP_HOTSPOT_OID:
                     try:
-                        suffix = oid_str[len(CONTROLLER_INFO_PREFIX):]
+                        payload = json.loads(val_str)
+                    except Exception:
+                        raw_msgs.append(f"{oid_str}={val_str}")
+                        continue
+
+                    max_temp = payload.get("maxTemp")
+                    hot_cabinets = payload.get("maxTempCabinets", [])
+                    points = []
+                    for c in hot_cabinets:
+                        if isinstance(c, dict):
+                            port = c.get("netPortIndex")
+                            cab = c.get("cabinetIndex")
+                            if port is not None and cab is not None:
+                                points.append((int(port), int(cab)))
+                    signature = (max_temp, tuple(sorted(points)))
+                    prev_signature = _mx40_hotspot_state.get(src_ip)
+                    _mx40_hotspot_state[src_ip] = signature
+
+                    if signature != prev_signature:
+                        if points:
+                            loc_txt = ", ".join([f"Port{p}/Cab{c}" for p, c in points])
+                        else:
+                            loc_txt = "unknown cabinet"
+                        events.append((
+                            "gray",
+                            f"Info,Controller,{proc_name},MX40,{src_ip},--, Max cabinet temperature {max_temp}C at {loc_txt}",
+                            f"{oid_str}={val_str}",
+                        ))
+                    continue
+
+                # MX40 periodieke metrics: suppress raw-spam, toon alleen betekenisvolle veranderingen.
+                if oid_str.startswith(MX40_METRIC_PREFIX):
+                    try:
+                        value = float(val_str)
+                    except (TypeError, ValueError):
+                        raw_msgs.append(f"{oid_str}={val_str}")
+                        continue
+
+                    key = (src_ip, oid_str)
+                    prev_value = _mx40_metric_state.get(key)
+                    _mx40_metric_state[key] = value
+
+                    # Alleen loggen als de metric zichtbaar wijzigt.
+                    if prev_value is not None and abs(value - prev_value) >= 2.0:
+                        metric_name = oid_str.replace(MX40_METRIC_PREFIX, "70.")
+                        events.append((
+                            "gray",
+                            f"Info,Controller,{proc_name},MX40,{src_ip},--, Telemetry {metric_name} changed to {value}",
+                            f"{oid_str}={val_str}",
+                        ))
+                    continue
+
+                normalized_oid = oid_str
+                for alt_prefix, canonical_prefix in MX40_ALT_PREFIX_MAP.items():
+                    if oid_str.startswith(alt_prefix):
+                        normalized_oid = canonical_prefix + oid_str[len(alt_prefix):]
+                        break
+
+                if oid_str == MONITOR_STATUS_OID:
+                    try:
+                        status_val = int(val_str)
+                    except (TypeError, ValueError):
+                        raw_msgs.append(f"{oid_str}={val_str}")
+                        continue
+
+                    prev_status = _monitor_status_by_ip.get(src_ip)
+                    _monitor_status_by_ip[src_ip] = status_val
+
+                    # 0=normal, 2=fault: log alleen bij wijziging om trap-heartbeat spam te vermijden.
+                    if status_val == 2 and prev_status != 2:
+                        events.append((
+                            "red",
+                            f"Error,Controller,{proc_name},MX2000 Pro,{src_ip},--, Status FAULT",
+                            f"{oid_str}={val_str}",
+                        ))
+                    elif status_val == 0 and prev_status == 2:
+                        events.append((
+                            "green",
+                            f"Recover,Controller,{proc_name},MX2000 Pro,{src_ip},--, Status NORMAL",
+                            f"{oid_str}={val_str}",
+                        ))
+                    continue
+                if normalized_oid.startswith(CONTROLLER_INFO_PREFIX):
+                    try:
+                        suffix = normalized_oid[len(CONTROLLER_INFO_PREFIX):]
                         parts = suffix.split(".")
                         if len(parts) == 1:
                             metric = parts[0]
@@ -961,9 +1298,9 @@ class CoexTrapListener(QThread):
                     except (ValueError, TypeError):
                         raw_msgs.append(f"{oid_str}={val_str}")
                     continue
-                if oid_str.startswith(INPUT_CARD_PREFIX):
+                if normalized_oid.startswith(INPUT_CARD_PREFIX):
                     try:
-                        suffix = oid_str[len(INPUT_CARD_PREFIX):]
+                        suffix = normalized_oid[len(INPUT_CARD_PREFIX):]
                         parts = suffix.split(".")
                         val = int(val_str)
                         # MIB: 110.N.Y  N=input card slot, Y=4 -> #bronnen, Y=1/2/3 -> temp/voltage/fan fout
@@ -1013,9 +1350,9 @@ class CoexTrapListener(QThread):
                     except (ValueError, TypeError):
                         raw_msgs.append(f"{oid_str}={val_str}")
                     continue
-                if oid_str.startswith(PORT_LINK_PREFIX):
+                if normalized_oid.startswith(PORT_LINK_PREFIX):
                     try:
-                        suffix = oid_str[len(PORT_LINK_PREFIX):]
+                        suffix = normalized_oid[len(PORT_LINK_PREFIX):]
                         parts = suffix.split(".")
                         link_val = int(val_str)
                         # MIB structuur: 1.3.6.1.4.1.319.10.120.N.Y[.metric]
@@ -1084,9 +1421,9 @@ class CoexTrapListener(QThread):
                     except (ValueError, IndexError):
                         raw_msgs.append(f"{oid_str}={val_str}")
                     continue
-                if oid_str.startswith(SCREEN_INFO_PREFIX):
+                if normalized_oid.startswith(SCREEN_INFO_PREFIX):
                     try:
-                        suffix = oid_str[len(SCREEN_INFO_PREFIX):]
+                        suffix = normalized_oid[len(SCREEN_INFO_PREFIX):]
                         parts = suffix.split(".")
                         # MIB: 130.N.1 = recv cards connected, 130.N.2 = temp abnormal, 130.N.3 = voltage abnormal
                         if len(parts) == 2:
@@ -1234,7 +1571,7 @@ class MonitorWorker(QThread):
                 ptype = proc.get("type", "").lower()
                 if not ip: continue
                 # COEX en andere SNMP-gebaseerde devices worden niet via HTTP gemonitord
-                if "coex" in ptype or "novastar" in ptype or "mx" in ptype:
+                if "coex" in ptype or "novastar" in ptype or "mx" in ptype or "brompton" in ptype:
                     continue
                 try:
                     url = f"http://{ip}/health/alerts"
@@ -1433,7 +1770,21 @@ class ScanWorker(QThread):
                         self.progress_signal.emit(50 + int((i/max(len(remaining),1))*50))
                         if result:
                             self.found_signal.emit(result[0], result[1], result[2])
+                            found_ips.add(result[0])
                             found_count += 1
+
+        # FASE 3: HTTP scan voor BROMPTON API endpoints
+        self.log_signal.emit("HTTP scan voor BROMPTON Tessera API...")
+        remaining = [ip for ip in ips_to_scan if ip not in found_ips]
+        if remaining:
+            with ThreadPoolExecutor(max_workers=64) as executor:
+                results = list(executor.map(self.check_ip_brompton, remaining))
+                for i, result in enumerate(results):
+                    self.progress_signal.emit(50 + int((i/max(len(remaining),1))*50))
+                    if result:
+                        self.found_signal.emit(result[0], result[1], result[2])
+                        found_ips.add(result[0])
+                        found_count += 1
 
         self.finished_signal.emit(found_count)
 
@@ -1457,6 +1808,38 @@ class ScanWorker(QThread):
                 name = self.fetch_processor_name(ip)
                 return (ip, "Helios", name)
         except: pass
+        return None
+
+    def check_ip_brompton(self, ip):
+        """Snelle probe voor Tessera API via read-only endpoints."""
+        probe_paths = [
+            "",
+            "devices/statistics/online-count",
+            "devices/statistics/error-count",
+            "system/software/version",
+        ]
+        base_urls = [f"http://{ip}/api", f"https://{ip}/api"]
+        try:
+            for base in base_urls:
+                for path in probe_paths:
+                    sep = "" if not path else "/"
+                    url = f"{base}{sep}{path}"
+                    try:
+                        resp = requests.get(url, timeout=0.8, verify=False)
+                    except Exception:
+                        continue
+                    status = int(resp.status_code)
+
+                    # 200 = direct match, 401/403 = endpoint bestaat maar auth nodig.
+                    if status in (200, 401, 403):
+                        detected_name = self.fetch_brompton_name(ip)
+                        return (ip, "BROMPTON", detected_name)
+
+                    # 404 op /api root niet als hit tellen, op andere paden kan firmware afhankelijk zijn.
+                    if status == 404 and path:
+                        continue
+        except Exception:
+            return None
         return None
 
     def check_ip_snmp(self, ip, S, timeout=0.15):
@@ -1546,6 +1929,33 @@ class ScanWorker(QThread):
 
         return ""
 
+    def fetch_brompton_name(self, ip):
+        candidates = [
+            "system/processor-name",
+            "system/name",
+            "presets/active/name",
+        ]
+        for path in candidates:
+            try:
+                resp = requests.get(f"http://{ip}/api/{path}", timeout=0.4)
+                if resp.status_code != 200:
+                    continue
+                data = resp.json() if resp.content else {}
+                if isinstance(data, dict):
+                    for key in ("processor-name", "name"):
+                        if key in data:
+                            value = self.clean_candidate(str(data.get(key, "")))
+                            if value:
+                                return value
+                    for value in data.values():
+                        if isinstance(value, str):
+                            value = self.clean_candidate(value)
+                            if value:
+                                return value
+            except Exception:
+                continue
+        return ""
+
     def extract_name_from_payload(self, payload):
         """Not used anymore, kept for compatibility"""
         return ""
@@ -1566,6 +1976,8 @@ def display_type_label(ptype):
     p = str(ptype or "")
     if p == "Novastar_COEX":
         return "COEX"
+    if p in ("Brompton", "BROMPTON"):
+        return "BROMPTON"
     return p
 
 class ProcessorCard(QFrame):
@@ -1662,7 +2074,7 @@ class SettingsDialog(QDialog):
         right.addWidget(self.lbl_action)
         self.inp_name = QLineEdit(); self.inp_name.setPlaceholderText("Name")
         self.inp_ip = QLineEdit(); self.inp_ip.setPlaceholderText("IP Address")
-        self.inp_type = QComboBox(); self.inp_type.addItems(["HELIOS", "COEX"])
+        self.inp_type = QComboBox(); self.inp_type.addItems(["HELIOS", "COEX", "BROMPTON"])
         
         right.addWidget(QLabel("Name:"))
         right.addWidget(self.inp_name)
@@ -1778,6 +2190,8 @@ class SettingsDialog(QDialog):
         t = str(ptype or "")
         if t == "Novastar_COEX":
             return "COEX"
+        if t in ("Brompton", "BROMPTON"):
+            return "BROMPTON"
         if t.lower() == "helios":
             return "HELIOS"
         return t.upper()
@@ -1786,6 +2200,8 @@ class SettingsDialog(QDialog):
         t = str(shown_type or "").upper()
         if t == "COEX":
             return "Novastar_COEX"
+        if t == "BROMPTON":
+            return "BROMPTON"
         if t == "HELIOS":
             return "Helios"
         return t
@@ -1845,14 +2261,14 @@ class SettingsDialog(QDialog):
 
     def on_found(self, ip, ptype, detected_name):
         detected_name = (detected_name or "").strip()
-        prefix_map = {"Helios": "Helios", "Novastar_COEX": "COEX"}
+        prefix_map = {"Helios": "Helios", "Novastar_COEX": "COEX", "Brompton": "BR", "BROMPTON": "BR"}
         prefix = prefix_map.get(ptype, "DEV")
         fallback_name = f"{prefix}-{ip.split('.')[-1]}"
 
         existing = next((p for p in self.processors if p.get('ip') == ip), None)
         if existing:
             current_name = str(existing.get('name', '')).strip()
-            generic_prefixes = ("Helios-", "COEX-", "BR-", "CL-", "DEV-")
+            generic_prefixes = ("Helios-", "COEX-", "BR-", "Brompton-", "BROMPTON-", "CL-", "DEV-")
             if detected_name and (not current_name or current_name.startswith(generic_prefixes)):
                 existing['name'] = detected_name
             # Update type als die nog niet juist was
@@ -1899,7 +2315,7 @@ class LEDLoggerApp(QMainWindow):
         self._ensure_web_server_config()
         self.history_data = load_json(HISTORY_FILE, [])
         self.processors = self.config["processors"]
-        self.processor_widgets = {}; self.sockets = {}; self.coex_threads = {}; self.selected_ip = None; self.log_history = []
+        self.processor_widgets = {}; self.sockets = {}; self.coex_threads = {}; self.brompton_threads = {}; self.selected_ip = None; self.log_history = []
         self.trap_listener = None
         self.web_server = None
         self.web_thread = None
@@ -2242,7 +2658,7 @@ class LEDLoggerApp(QMainWindow):
 
     def init_sockets(self):
         for ip, sock in self.sockets.items():
-            if not isinstance(sock, NovastarCoexSocket):
+            if not isinstance(sock, (NovastarCoexSocket, BromptonSocket)):
                 sock.stop()
         for ip, t in self.coex_threads.items():
             sock = self.sockets.get(ip)
@@ -2250,7 +2666,14 @@ class LEDLoggerApp(QMainWindow):
                 QMetaObject.invokeMethod(sock, "stop", Qt.QueuedConnection)
             t.quit()
             t.wait(1200)
+        for ip, t in self.brompton_threads.items():
+            sock = self.sockets.get(ip)
+            if isinstance(sock, BromptonSocket):
+                QMetaObject.invokeMethod(sock, "stop", Qt.QueuedConnection)
+            t.quit()
+            t.wait(1200)
         self.coex_threads = {}
+        self.brompton_threads = {}
         self.sockets = {}
         for p in self.processors:
             ip = p.get("ip")
@@ -2259,6 +2682,17 @@ class LEDLoggerApp(QMainWindow):
                 sock = HeliosSocket(ip, p.get("name"), parent=self)
                 sock.error_detected.connect(self.on_socket_error)
                 self.sockets[ip] = sock
+            elif "brompton" in ptype:
+                poll_interval = p.get("brompton_poll_interval", BROMPTON_POLL_INTERVAL_SEC)
+                sock = BromptonSocket(ip, p.get("name"), poll_interval=poll_interval, parent=None)
+                sock.error_detected.connect(self.on_socket_error)
+                self.sockets[ip] = sock
+                t = QThread(self)
+                sock.moveToThread(t)
+                t.started.connect(sock.start_polling)
+                t.finished.connect(sock.deleteLater)
+                self.brompton_threads[ip] = t
+                t.start()
             elif "coex" in ptype or "novastar" in ptype or "mx" in ptype:
                 community = p.get("snmp_community", "public")
                 port_map = p.get("coex_port_map", {})
@@ -2406,6 +2840,8 @@ class LEDLoggerApp(QMainWindow):
         # Doe daarom meteen een extra poll op dezelfde COEX, zodat poll-OIDs
         # (zoals input_src_status) direct ge-evalueerd worden.
         if msg.startswith("TRAP_RAW:"):
+            if "1.3.6.1.4.1.319.10.10.70." in msg or "1.3.6.1.4.1.319.10.10.30.6.1.3.1.1" in msg:
+                return
             sock = self.sockets.get(ip)
             if isinstance(sock, NovastarCoexSocket):
                 QMetaObject.invokeMethod(sock, "poll_health", Qt.QueuedConnection)
@@ -2693,11 +3129,17 @@ class LEDLoggerApp(QMainWindow):
                 pass
 
         for ip, sock in self.sockets.items():
-            if not isinstance(sock, NovastarCoexSocket):
+            if not isinstance(sock, (NovastarCoexSocket, BromptonSocket)):
                 sock.stop()
         for ip, t in self.coex_threads.items():
             sock = self.sockets.get(ip)
             if isinstance(sock, NovastarCoexSocket):
+                QMetaObject.invokeMethod(sock, "stop", Qt.QueuedConnection)
+            t.quit()
+            t.wait(1200)
+        for ip, t in self.brompton_threads.items():
+            sock = self.sockets.get(ip)
+            if isinstance(sock, BromptonSocket):
                 QMetaObject.invokeMethod(sock, "stop", Qt.QueuedConnection)
             t.quit()
             t.wait(1200)

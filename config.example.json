@@ -6,6 +6,12 @@
             "type": "Helios"
         },
         {
+            "name": "Brompton Tessera",
+            "ip": "192.168.1.15",
+            "type": "BROMPTON",
+            "brompton_poll_interval": 3
+        },
+        {
             "name": "MX2000 Pro Test",
             "ip": "192.168.1.20",
             "type": "Novastar_COEX",
