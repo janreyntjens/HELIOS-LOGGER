@@ -8,7 +8,9 @@ import ctypes
 import base64
 import hashlib
 import hmac
+import html as html_escape
 import ipaddress
+import re
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -134,6 +136,118 @@ class LogWebServer(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Authentication required")
 
+    def _send_json(self, status_code, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(int(status_code))
+        self.send_header("Content-type", "application/json; charset=utf-8")
+        self.send_header("Content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            return None
+        try:
+            raw = self.rfile.read(length)
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_valid_mac(value):
+        return bool(re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", str(value or "").strip().lower()))
+
+    @staticmethod
+    def _set_helios_identify_http(ip, mac, enabled):
+        payload = {
+            "dev": {
+                "receivers": {
+                    mac: {
+                        "identifyEnabled": bool(enabled)
+                    }
+                }
+            }
+        }
+        url = f"http://{ip}/api/v1/data"
+        for method in ("POST", "PATCH"):
+            try:
+                resp = requests.request(method, url, json=payload, timeout=1.5)
+                if not (200 <= int(resp.status_code) < 300):
+                    continue
+
+                try:
+                    data = resp.json() if resp.content else {}
+                    got = (
+                        data.get("dev", {})
+                        .get("receivers", {})
+                        .get(mac, {})
+                        .get("identifyEnabled")
+                    )
+                    if isinstance(got, bool):
+                        return got == bool(enabled)
+                except Exception:
+                    pass
+
+                try:
+                    read = requests.get(f"http://{ip}/api/v1/public?dev.receivers.{mac}", timeout=1.5)
+                    if 200 <= int(read.status_code) < 300:
+                        data = read.json() if read.content else {}
+                        got = (
+                            data.get("dev", {})
+                            .get("receivers", {})
+                            .get(mac, {})
+                            .get("identifyEnabled")
+                        )
+                        if isinstance(got, bool):
+                            return got == bool(enabled)
+                except Exception:
+                    pass
+            except Exception:
+                continue
+        return False
+
+    def do_POST(self):
+        try:
+            if not self._is_authorized():
+                self._send_auth_required()
+                return
+
+            path = self.path.split("?", 1)[0]
+            if path != "/identify":
+                self._send_json(404, {"ok": False, "error": "Not found"})
+                return
+
+            data = self._read_json_body()
+            if not isinstance(data, dict):
+                self._send_json(400, {"ok": False, "error": "Invalid JSON payload"})
+                return
+
+            ip = str(data.get("ip", "")).strip()
+            mac = str(data.get("mac", "")).strip().lower().replace("-", ":")
+            enabled = bool(data.get("enabled", False))
+
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                self._send_json(400, {"ok": False, "error": "Invalid IP"})
+                return
+
+            if not self._is_valid_mac(mac):
+                self._send_json(400, {"ok": False, "error": "Invalid MAC"})
+                return
+
+            ok = self._set_helios_identify_http(ip, mac, enabled)
+            if ok:
+                self._send_json(200, {"ok": True, "state": enabled})
+            else:
+                self._send_json(502, {"ok": False, "error": "Identify command failed"})
+        except Exception as e:
+            self._send_json(500, {"ok": False, "error": str(e)})
+
     def do_GET(self):
         try:
             if not self._is_authorized():
@@ -152,7 +266,7 @@ class LogWebServer(BaseHTTPRequestHandler):
             # Snellere refresh direct na een clear
             refresh_interval = 2 if (time.time() - self.last_clear_time) < 10 else 5
 
-            html = f"""
+            page_html = f"""
             <html>
             <head>
                 <title>{APP_NAME} Remote Monitor</title>
@@ -191,9 +305,16 @@ class LogWebServer(BaseHTTPRequestHandler):
 
                     .entry {{ padding: 8px 12px; background: #181818; border-radius: 4px; margin-bottom: 4px; border-left: 4px solid #333; font-family: 'Consolas', monospace; }}
                     .time {{ color: #666; font-size: 12px; margin-right: 10px; }}
+                    .device {{ color: #9aa4b2; font-size: 12px; margin-right: 10px; }}
+                    .meta {{ color: #8e98a8; font-size: 12px; margin-right: 10px; }}
+                    .meta .kv {{ margin-right: 8px; }}
                     .red {{ border-left-color: #e74c3c; color: #ff6b6b; font-weight: bold; }}
+                    .orange {{ border-left-color: #ff9800; color: #ff9800; font-weight: bold; }}
                     .green {{ border-left-color: #2ecc71; color: #2ecc71; }}
-                    .system {{ border-left-color: #2a82da; color: #2a82da; font-style: italic; }}
+                    .system {{ border-left-color: #777; color: #b7b7b7; font-style: italic; }}
+                    .id-toggle {{ float: right; display: inline-flex; align-items: center; gap: 6px; color: #9aa4b2; font-size: 12px; }}
+                    .id-toggle input {{ width: 14px; height: 14px; accent-color: #2ecc71; cursor: pointer; }}
+                    .id-toggle span {{ user-select: none; }}
                 </style>
             </head>
             <body>
@@ -206,19 +327,91 @@ class LogWebServer(BaseHTTPRequestHandler):
                 </div>
                 <div id="logs">
             """
-            for entry in reversed(self.log_data[-100:]):
+            for entry in self.log_data[-100:]:
                 try:
                     if not isinstance(entry, dict):
                         continue
                     color_class = "system" if entry.get("ip") == "SYSTEM" else entry.get("color", "gray")
-                    ts = str(entry.get("time", "--:--:--"))
-                    msg = str(entry.get("msg", ""))
-                    html += f'<div class="entry {color_class}"><span class="time">[{ts}]</span> {msg}</div>'
+                    ts = html_escape.escape(str(entry.get("time", "--:--:--")))
+                    msg_raw = str(entry.get("msg", ""))
+                    msg = html_escape.escape(msg_raw)
+                    ip_raw = str(entry.get("ip", "") or "").strip()
+
+                    identify_html = ""
+                    receiver_info = entry.get("receiver_info", {}) if isinstance(entry.get("receiver_info", {}), dict) else {}
+                    mac_raw = str(receiver_info.get("mac", "") or "").strip().lower().replace("-", ":")
+                    sfp_raw = str(receiver_info.get("sfp", "") or "").strip()
+                    output_raw = str(receiver_info.get("output", "") or "").strip()
+                    tile_raw = str(receiver_info.get("chain_pos", "") or "").strip()
+                    device_txt = "SYSTEM" if ip_raw == "SYSTEM" else (ip_raw or "-")
+                    device_html = f'<span class="device">[{html_escape.escape(device_txt)}]</span>'
+
+                    meta_parts = []
+                    if sfp_raw and sfp_raw != "-":
+                        meta_parts.append(f'<span class="kv">OPT:{html_escape.escape(sfp_raw)}</span>')
+                    if output_raw and output_raw != "-":
+                        meta_parts.append(f'<span class="kv">PORT:{html_escape.escape(output_raw)}</span>')
+                    if tile_raw and tile_raw != "-":
+                        meta_parts.append(f'<span class="kv">TILE:{html_escape.escape(tile_raw)}</span>')
+                    meta_html = f'<span class="meta">{"".join(meta_parts)}</span>' if meta_parts else ""
+
+                    if ip_raw and ip_raw != "SYSTEM" and self._is_valid_mac(mac_raw):
+                        ip_attr = html_escape.escape(ip_raw, quote=True)
+                        mac_attr = html_escape.escape(mac_raw, quote=True)
+                        identify_html = (
+                            f'<label class="id-toggle">'
+                            f'<input class="identify-cb" type="checkbox" data-ip="{ip_attr}" data-mac="{mac_attr}">'
+                            f'<span>ID</span>'
+                            f'</label>'
+                        )
+
+                    page_html += f'<div class="entry {color_class}"><span class="time">[{ts}]</span>{device_html}{meta_html} {msg}{identify_html}</div>'
                 except Exception:
                     continue
 
-            html += "</div></body></html>"
-            self.wfile.write(html.encode("utf-8"))
+            page_html += """
+                </div>
+                <script>
+                    (() => {
+                        const keyPrefix = 'idstate:';
+                        const controls = document.querySelectorAll('.identify-cb');
+                        controls.forEach((cb) => {
+                            const ip = cb.dataset.ip || '';
+                            const mac = cb.dataset.mac || '';
+                            if (!ip || !mac) return;
+                            const storageKey = keyPrefix + ip + '|' + mac;
+                            const saved = localStorage.getItem(storageKey);
+                            if (saved === '1') cb.checked = true;
+
+                            cb.addEventListener('change', async () => {
+                                const enabled = !!cb.checked;
+                                cb.disabled = true;
+                                try {
+                                    const res = await fetch('/identify', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ ip, mac, enabled })
+                                    });
+                                    let data = {};
+                                    try { data = await res.json(); } catch (_) {}
+                                    if (!res.ok || !data.ok) {
+                                        throw new Error((data && data.error) ? data.error : 'Identify command failed');
+                                    }
+                                    localStorage.setItem(storageKey, enabled ? '1' : '0');
+                                } catch (err) {
+                                    cb.checked = !enabled;
+                                    alert('Identify failed: ' + (err && err.message ? err.message : 'unknown error'));
+                                } finally {
+                                    cb.disabled = false;
+                                }
+                            });
+                        });
+                    })();
+                </script>
+            </body>
+            </html>
+            """
+            self.wfile.write(page_html.encode("utf-8"))
         except Exception as e:
             try:
                 self.send_response(500)
@@ -236,7 +429,9 @@ def severity_to_color(severity):
     # print(f"DEBUG: severity='{severity}' -> '{sev}'")
     
     # 'none' means alert cleared/resolved
-    if sev in ["", "none", "null"]: 
+    if sev in ["none", "null"]:
+        return "green"
+    if sev in [""]:
         return "gray"
     
     # Helios severity mapping
@@ -248,6 +443,20 @@ def severity_to_color(severity):
         return "green"
     
     # Unknown severity
+    return "gray"
+
+def normalize_log_color(color, ip=""):
+    """Force logs into 4 colors: system=gray, recover=green, warning=orange, error=red."""
+    if str(ip or "").strip().upper() == "SYSTEM":
+        return "gray"
+
+    c = str(color or "").strip().lower()
+    if c in ("red", "error", "critical"):
+        return "red"
+    if c in ("orange", "warning", "warn", "yellow"):
+        return "orange"
+    if c in ("green", "recover", "ok", "success"):
+        return "green"
     return "gray"
 
 class HeliosSocket(QObject):
@@ -291,8 +500,7 @@ class HeliosSocket(QObject):
             if current_message_errors:
                 for err_id, (msg, raw_data) in current_message_errors.items():
                     if err_id not in self.active_errors:
-                        severity = raw_data.get("severity", "error") if isinstance(raw_data, dict) else "error"
-                        color = severity_to_color(severity)
+                        color, msg = self._resolve_helios_alert_style(err_id, msg, raw_data)
                         self.error_detected.emit(color, f"{self.name}: {msg}", self.ip)
                         self.active_errors.add(err_id)
             
@@ -302,16 +510,123 @@ class HeliosSocket(QObject):
                         self.active_errors.remove(old_err)
         except: pass
 
+    def _resolve_helios_alert_style(self, alert_key, formatted_msg, raw_data):
+        key = str(alert_key or "").strip().lower()
+        if not isinstance(raw_data, dict):
+            text = str(raw_data or "").strip().lower()
+            full_text = str(formatted_msg or "").strip().lower()
+
+            if text in ("none", "null") or full_text.endswith("] none") or full_text.endswith("] null"):
+                if not formatted_msg.lower().startswith("recover:"):
+                    return "green", f"Recover: {formatted_msg}"
+                return "green", formatted_msg
+
+            if key.startswith("ethdrop") and "dropped link" in full_text:
+                m = re.search(r"dropped\s+link\s*:\s*(\d+)", full_text, flags=re.IGNORECASE)
+                if m:
+                    try:
+                        if int(m.group(1)) > 0:
+                            return "red", formatted_msg
+                    except ValueError:
+                        pass
+                return "red", formatted_msg
+
+            if key == "tilebackupmissing" and "backup missing" in full_text:
+                return "red", formatted_msg
+
+            return "orange", formatted_msg
+
+        severity = raw_data.get("severity", "error")
+        color = severity_to_color(severity)
+
+        brief = str(raw_data.get("brief", "")).strip()
+        desc = str(raw_data.get("desc", "")).strip()
+        brief_l = brief.lower()
+        desc_l = desc.lower()
+
+        # Helios uses 'None' for cleared/resolved alerts.
+        if brief_l in ("none", "null") or desc_l in ("none", "null"):
+            if not formatted_msg.lower().startswith("recover:"):
+                return "green", f"Recover: {formatted_msg}"
+            return "green", formatted_msg
+
+        # ethDrop alerts: any dropped link count > 0 is an active fault.
+        if key.startswith("ethdrop") and ("dropped link" in brief_l or "dropped link" in desc_l):
+            dropped = None
+            src_txt = brief if "dropped link" in brief_l else desc
+            m = re.search(r"dropped\s+link\s*:\s*(\d+)", src_txt, flags=re.IGNORECASE)
+            if m:
+                try:
+                    dropped = int(m.group(1))
+                except ValueError:
+                    dropped = None
+
+            if dropped is not None:
+                if dropped > 0:
+                    return "red", formatted_msg
+                if not formatted_msg.lower().startswith("recover:"):
+                    return "green", f"Recover: {formatted_msg}"
+                return "green", formatted_msg
+
+            # If we cannot parse count but got a dropped-link alert, fail safe to red.
+            return "red", formatted_msg
+
+        # tileBackupMissing with explicit missing state should stay fault (red).
+        if key == "tilebackupmissing" and ("backup missing" in brief_l or "backup missing" in desc_l):
+            return "red", formatted_msg
+
+        return color, formatted_msg
+
     def format_error(self, key, val):
-        parts = [f"[{key}]"]
+        parts = []
         if isinstance(val, dict):
             brief = str(val.get("brief", "")).strip()
             desc = str(val.get("desc", "")).strip()
+            brief_l = brief.lower()
+            desc_l = desc.lower()
+            show_key = brief_l in ("none", "null") or desc_l in ("none", "null")
+
+            if show_key:
+                parts.append(f"[{key}]")
             if brief: parts.append(brief)
             if desc and desc != brief: parts.append(f"| {desc}")
+            if not parts:
+                parts.append(str(key))
         else:
-            parts.append(str(val))
+            value_txt = str(val).strip()
+            value_l = value_txt.lower()
+            if value_l in ("none", "null"):
+                parts.append(f"[{key}] {value_txt}")
+            else:
+                parts.append(value_txt if value_txt else str(key))
         return " ".join(parts)
+
+    def send_receiver_identify(self, receiver_mac, enabled):
+        """Send identify toggle for a receiver MAC over the active Helios websocket."""
+        try:
+            if self.ws.state() != QAbstractSocket.ConnectedState:
+                return False
+            mac = str(receiver_mac or "").strip().lower()
+            if not mac:
+                return False
+            payload = {
+                "jsonrpc": "2.0",
+                "id": int(time.time() * 1000) % 1000000,
+                "method": "set",
+                "params": {
+                    "dev": {
+                        "receivers": {
+                            mac: {
+                                "identifyEnabled": bool(enabled)
+                            }
+                        }
+                    }
+                }
+            }
+            self.ws.sendTextMessage(json.dumps(payload))
+            return True
+        except Exception:
+            return False
 
     def stop(self):
         self.retry_timer.stop()
@@ -319,6 +634,28 @@ class HeliosSocket(QObject):
 
 
 BROMPTON_POLL_INTERVAL_SEC = 3
+BROMPTON_INPUT_STATUS_CANDIDATE_PATHS = (
+    "input",
+    "input/all/status",
+    "input/status",
+    "input/source/status",
+    "input/sources/status",
+    "devices/input/status",
+    "devices/inputs/status",
+)
+BROMPTON_FAN_RPM_MIN = {
+    "case.one": 1000,
+    "case.two": 1000,
+    "fpga": 3000,
+}
+BROMPTON_TEMP_WARN_C = {
+    "ambient": 45,
+    "cpu": 70,
+    "gpu": 70,
+    "fpga": 75,
+    "main": 65,
+    "psu": 70,
+}
 
 
 class BromptonSocket(QObject):
@@ -436,36 +773,535 @@ class BromptonSocket(QObject):
                 return False
         return None
 
-    @Slot()
-    def poll_health(self):
-        endpoints = {
-            "software_version": ("system/software/version", "version"),
-            "error_count": ("devices/statistics/error-count", "error-count"),
-            "online_count": ("devices/statistics/online-count", "online-count"),
-            "fan_case_1": ("system/fan/case/one/status", "status"),
-            "fan_case_2": ("system/fan/case/two/status", "status"),
-            "fan_fpga": ("system/fan/fpga/status", "status"),
+    def _normalize_input_status(self, value):
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return "connected" if value else "disconnected"
+        if isinstance(value, (int, float)):
+            i = int(value)
+            if i in (0, 1):
+                return "connected" if i else "disconnected"
+            return str(i)
+
+        txt = str(value).strip().lower().replace("_", " ").replace("-", " ")
+        if not txt:
+            return None
+        if txt in ("true", "yes", "on", "up"):
+            return "connected"
+        if txt in ("false", "no", "off", "down"):
+            return "disconnected"
+        return txt
+
+    def _looks_like_input_name(self, key):
+        k = str(key or "").strip().lower().replace("_", "").replace("-", "")
+        if not k:
+            return False
+        if k.startswith("input") and any(ch.isdigit() for ch in k):
+            return True
+        if k.startswith("in") and k[2:].isdigit():
+            return True
+        for prefix in ("hdmi", "dp", "dvi", "sdi", "source"):
+            if k.startswith(prefix):
+                return True
+        return False
+
+    def _normalize_input_name(self, name, fallback_index=None):
+        txt = str(name or "").strip()
+        if not txt and fallback_index is not None:
+            txt = f"Input {fallback_index + 1}"
+        if not txt:
+            return None
+
+        raw = txt.replace("_", " ").replace("-", " ").strip()
+        low = raw.lower()
+        if low.startswith("in") and raw[2:].isdigit():
+            return f"Input {int(raw[2:])}"
+        if low.startswith("input"):
+            tail = raw[5:].strip()
+            if tail.isdigit():
+                return f"Input {int(tail)}"
+        return raw
+
+    def _extract_input_status_from_item(self, item):
+        if not isinstance(item, dict):
+            return self._normalize_input_status(item)
+
+        for key in ("status", "state", "connection", "signal", "link", "connected", "present", "active", "locked", "value"):
+            if key not in item:
+                continue
+            raw = item.get(key)
+            if isinstance(raw, bool):
+                if key == "active":
+                    return "active" if raw else "inactive"
+                return "connected" if raw else "disconnected"
+            if isinstance(raw, (int, float)):
+                i = int(raw)
+                if key == "active":
+                    return "active" if i else "inactive"
+                if i in (0, 1):
+                    return "connected" if i else "disconnected"
+            normalized = self._normalize_input_status(raw)
+            if normalized is not None:
+                return normalized
+        return None
+
+    def _extract_input_status_map(self, payload):
+        found = {}
+
+        def add_status(name, status, fallback_index=None):
+            norm_name = self._normalize_input_name(name, fallback_index=fallback_index)
+            norm_status = self._normalize_input_status(status)
+            if norm_name and norm_status is not None:
+                found[norm_name] = norm_status
+
+        # Fallback for Tessera /api/input payloads where status is implicit in metadata.
+        root = payload
+        if isinstance(root, dict) and isinstance(root.get("input"), dict):
+            root = root.get("input")
+        if isinstance(root, dict):
+            ports = root.get("ports")
+            if isinstance(ports, dict):
+                for port_type, port_group in ports.items():
+                    if not isinstance(port_group, dict):
+                        continue
+                    for port_idx, port_data in port_group.items():
+                        if not isinstance(port_data, dict):
+                            continue
+
+                        status_value = None
+                        meta = port_data.get("meta-data")
+                        if isinstance(meta, dict):
+                            resolution = meta.get("resolution")
+                            refresh = meta.get("refresh-rate")
+                            width = None
+                            height = None
+                            if isinstance(resolution, dict):
+                                width = self._to_int(resolution.get("width"))
+                                height = self._to_int(resolution.get("height"))
+                            refresh_i = self._to_int(refresh)
+
+                            if width is not None and height is not None and refresh_i is not None:
+                                if width > 0 and height > 0 and refresh_i > 0:
+                                    status_value = "connected"
+                                else:
+                                    status_value = "no signal"
+
+                        if status_value is None:
+                            status_value = self._extract_input_status_from_item(port_data)
+                        if status_value is None:
+                            continue
+
+                        idx_txt = str(port_idx).strip()
+                        try:
+                            idx_num = int(idx_txt)
+                            port_name = f"{str(port_type).upper()} {idx_num + 1}"
+                        except (TypeError, ValueError):
+                            port_name = f"{str(port_type).upper()} {idx_txt}"
+                        add_status(port_name, status_value)
+
+        def walk(node):
+            if isinstance(node, list):
+                for idx, item in enumerate(node):
+                    if isinstance(item, dict):
+                        name = item.get("name") or item.get("input") or item.get("source") or item.get("label") or item.get("id")
+                        status = self._extract_input_status_from_item(item)
+                        if name is not None and status is not None:
+                            add_status(name, status, fallback_index=idx)
+                        walk(item)
+                    else:
+                        status = self._normalize_input_status(item)
+                        if status is not None:
+                            add_status(None, status, fallback_index=idx)
+                return
+
+            if not isinstance(node, dict):
+                return
+
+            if "name" in node:
+                status = self._extract_input_status_from_item(node)
+                if status is not None:
+                    add_status(node.get("name"), status)
+
+            for container_key in ("inputs", "input", "sources", "source", "ports"):
+                child = node.get(container_key)
+                if isinstance(child, (dict, list)):
+                    walk(child)
+
+            for key, value in node.items():
+                if self._looks_like_input_name(key):
+                    status = self._extract_input_status_from_item(value)
+                    if status is not None:
+                        add_status(key, status)
+                    continue
+
+                if isinstance(value, (dict, list)):
+                    walk(value)
+
+        walk(payload)
+        return found
+
+    def _input_change_style(self, old_status, new_status):
+        new_txt = str(new_status or "").lower()
+        old_txt = str(old_status or "").lower()
+        bad_tokens = ("disconnect", "no signal", "fail", "loss", "down", "unplug")
+        good_tokens = ("connect", "active", "ok", "up", "locked", "present")
+
+        is_bad = any(token in new_txt for token in bad_tokens)
+        was_bad = any(token in old_txt for token in bad_tokens)
+        is_good = any(token in new_txt for token in good_tokens)
+
+        if is_bad:
+            return "Error", "red"
+        if is_good and was_bad:
+            return "Recover", "green"
+        return "Info", "gray"
+
+    def _parse_uptime_seconds(self, value):
+        txt = str(value or "").strip().lower()
+        if not txt:
+            return None
+
+        total = 0
+        num = ""
+        unit_map = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+        for ch in txt:
+            if ch.isdigit():
+                num += ch
+                continue
+            if ch in unit_map and num:
+                total += int(num) * unit_map[ch]
+                num = ""
+            elif ch in (" ", ","):
+                continue
+            else:
+                num = ""
+        return total if total > 0 else None
+
+    def _flatten_scalars(self, node, prefix=""):
+        out = {}
+        if isinstance(node, dict):
+            for key, value in node.items():
+                key_txt = str(key)
+                new_prefix = f"{prefix}.{key_txt}" if prefix else key_txt
+                out.update(self._flatten_scalars(value, new_prefix))
+            return out
+        if isinstance(node, list):
+            for idx, value in enumerate(node):
+                new_prefix = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+                out.update(self._flatten_scalars(value, new_prefix))
+            return out
+        if prefix:
+            out[prefix] = node
+        return out
+
+    def _extract_active_source(self, payload):
+        root = payload
+        if isinstance(root, dict) and isinstance(root.get("input"), dict):
+            root = root.get("input")
+        if not isinstance(root, dict):
+            return None
+
+        active = root.get("active")
+        if not isinstance(active, dict):
+            return None
+        source = active.get("source")
+        if not isinstance(source, dict):
+            return None
+
+        port_type = str(source.get("port-type") or source.get("type") or "").strip().upper()
+        port_number = self._to_int(source.get("port-number"))
+        if port_number is not None:
+            port_number += 1
+        if port_type and port_number is not None:
+            return f"{port_type} {port_number}"
+        if port_type:
+            return port_type
+        if port_number is not None:
+            return f"Input {port_number}"
+        return None
+
+    def _extract_input_signal_map(self, payload):
+        result = {}
+        root = payload
+        if isinstance(root, dict) and isinstance(root.get("input"), dict):
+            root = root.get("input")
+        if not isinstance(root, dict):
+            return result
+
+        ports = root.get("ports")
+        if not isinstance(ports, dict):
+            return result
+
+        for port_type, port_group in ports.items():
+            if not isinstance(port_group, dict):
+                continue
+            for port_idx, port_data in port_group.items():
+                if not isinstance(port_data, dict):
+                    continue
+                idx_txt = str(port_idx).strip()
+                try:
+                    idx_num = int(idx_txt)
+                    name = f"{str(port_type).upper()} {idx_num + 1}"
+                except (TypeError, ValueError):
+                    name = f"{str(port_type).upper()} {idx_txt}"
+
+                meta = port_data.get("meta-data")
+                if not isinstance(meta, dict):
+                    continue
+
+                resolution = meta.get("resolution") if isinstance(meta.get("resolution"), dict) else {}
+                width = self._to_int(resolution.get("width"))
+                height = self._to_int(resolution.get("height"))
+                refresh = self._to_int(meta.get("refresh-rate"))
+                bit_depth = self._to_int(meta.get("bit-depth"))
+                sampling = str(meta.get("sampling") or "").strip().lower()
+
+                hdr_fmt = ""
+                hdr_meta = meta.get("hdr")
+                if isinstance(hdr_meta, dict):
+                    hdr_fmt = str(hdr_meta.get("format") or "").strip().lower()
+
+                if width is not None and height is not None and refresh is not None and width > 0 and height > 0 and refresh > 0:
+                    hdr_part = f", {hdr_fmt}" if hdr_fmt else ""
+                    bd_part = f", {bit_depth}-bit" if bit_depth is not None and bit_depth > 0 else ""
+                    samp_part = f", {sampling}" if sampling else ""
+                    result[name] = f"{width}x{height}@{refresh}Hz{bd_part}{samp_part}{hdr_part}"
+                else:
+                    result[name] = "no signal"
+        return result
+
+    def _extract_network_state(self, payload):
+        root = payload
+        if isinstance(root, dict) and isinstance(root.get("output"), dict):
+            root = root.get("output")
+        if isinstance(root, dict) and isinstance(root.get("network"), dict):
+            root = root.get("network")
+        if not isinstance(root, dict):
+            return {}
+
+        out = {}
+        failover = root.get("failover")
+        if isinstance(failover, dict):
+            settings = failover.get("settings") if isinstance(failover.get("settings"), dict) else {}
+            state = failover.get("state") if isinstance(failover.get("state"), dict) else {}
+            out["failover.enabled"] = self._to_bool(settings.get("enabled"))
+            out["failover.role"] = str(settings.get("role") or "").strip().lower() or None
+            out["failover.is_active"] = self._to_bool(state.get("is-active"))
+            out["failover.partner_present"] = self._to_bool(state.get("is-partner-present"))
+
+        genlock = root.get("genlock")
+        if isinstance(genlock, dict):
+            out["genlock.source"] = str(genlock.get("source") or "").strip().lower() or None
+            out["genlock.internal_rate"] = self._to_int(genlock.get("internal-rate"))
+
+        return out
+
+    def _extract_system_state(self, payload):
+        root = payload
+        if isinstance(root, dict) and isinstance(root.get("system"), dict):
+            root = root.get("system")
+        if not isinstance(root, dict):
+            return {}
+
+        out = {
+            "processor_name": str(root.get("processor-name") or "").strip() or None,
+            "processor_type": str(root.get("processor-type") or "").strip() or None,
+            "serial_number": str(root.get("serial-number") or "").strip() or None,
+            "software_version": str(root.get("software-version") or "").strip() or None,
+            "uptime_raw": str(root.get("uptime") or "").strip() or None,
         }
 
+        out["uptime_seconds"] = self._parse_uptime_seconds(out.get("uptime_raw"))
+
+        temp = root.get("temperature")
+        if isinstance(temp, dict):
+            for key, value in self._flatten_scalars(temp, "temperature").items():
+                if isinstance(value, (int, float)):
+                    out[key] = float(value)
+
+        fan = root.get("fan")
+        if isinstance(fan, dict):
+            one = fan.get("case", {}).get("one") if isinstance(fan.get("case"), dict) else None
+            two = fan.get("case", {}).get("two") if isinstance(fan.get("case"), dict) else None
+            fpga = fan.get("fpga") if isinstance(fan.get("fpga"), dict) else None
+            if isinstance(one, dict):
+                out["fan.case.one.speed"] = self._to_int(one.get("speed"))
+                out["fan.case.one.status"] = self._to_bool(one.get("status"))
+            if isinstance(two, dict):
+                out["fan.case.two.speed"] = self._to_int(two.get("speed"))
+                out["fan.case.two.status"] = self._to_bool(two.get("status"))
+            if isinstance(fpga, dict):
+                out["fan.fpga.speed"] = self._to_int(fpga.get("speed"))
+                out["fan.fpga.status"] = self._to_bool(fpga.get("status"))
+
+        return out
+
+    def _parse_loop_state_summary(self, raw_value):
+        """Return (issues, seen_ok) for Tessera cable loop state payloads."""
+        raw = str(raw_value or "").strip()
+        if not raw:
+            return None, False
+
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if not parts:
+            return None, False
+
+        issues = []
+        seen_ok = False
+        for part in parts:
+            left, sep, right = part.partition(":")
+            status_txt = (left if sep else part).strip().lower().replace("_", "-")
+            detail_txt = right.strip() if sep else ""
+
+            if status_txt == "loop-found":
+                seen_ok = True
+                continue
+            if status_txt == "no-loop-found":
+                label = "No connection"
+            elif status_txt == "incorrect-loop-found":
+                label = "Incorrect loop"
+            elif status_txt == "one-to-many-error":
+                label = "One-to-many error"
+            else:
+                continue
+
+            port = ""
+            if "->" in detail_txt:
+                port = detail_txt.split("->", 1)[0].strip()
+            if port:
+                issues.append(f"{label} ({port})")
+            else:
+                issues.append(label)
+
+        if issues:
+            return issues, False
+        if seen_ok:
+            return [], True
+        return None, False
+
+    def _compact_payload_text(self, payload, max_len=1100):
+        try:
+            txt = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+        except Exception:
+            txt = str(payload)
+        if len(txt) > max_len:
+            return txt[:max_len] + " ..."
+        return txt
+
+    @Slot()
+    def trigger_test(self):
+        """Emit a snapshot with key Tessera API values for this processor."""
+        summary_paths = [
+            "system",
+            "devices/statistics",
+            "input",
+            "input/active",
+            "output/network",
+            "output/network/cable-redundancy",
+            "output/network/cable-redundancy/loops/1/state",
+            "output/network/cable-redundancy/loops/2/state",
+            "output/network/cable-redundancy/loops/3/state",
+            "output/network/cable-redundancy/loops/4/state",
+        ]
+
+        self.error_detected.emit(
+            "gray",
+            f"Info,Controller,{self.name},BROMPTON,{self.ip},--,Test started",
+            self.ip,
+        )
+
+        any_ok = False
+        for path in summary_paths:
+            try:
+                reachable, payload, status, _used_url = self._api_get(path, timeout=1.2)
+            except Exception:
+                reachable = False
+                payload = None
+                status = None
+
+            if not reachable:
+                continue
+            if status in (401, 403):
+                self.error_detected.emit(
+                    "orange",
+                    f"Warning,Controller,{self.name},BROMPTON,{self.ip},--,Test [{path}]: auth required ({status})",
+                    self.ip,
+                )
+                continue
+            if status == 404:
+                continue
+
+            any_ok = True
+            value_txt = self._compact_payload_text(payload)
+            self.error_detected.emit(
+                "gray",
+                f"Info,Controller,{self.name},BROMPTON,{self.ip},--,Test [{path}]: {value_txt}",
+                self.ip,
+            )
+
+        if any_ok:
+            self.error_detected.emit(
+                "green",
+                f"Recover,Controller,{self.name},BROMPTON,{self.ip},--,Test complete",
+                self.ip,
+            )
+        else:
+            self.error_detected.emit(
+                "red",
+                f"Error,Controller,{self.name},BROMPTON,{self.ip},--,Test failed: no API responses",
+                self.ip,
+            )
+
+    @Slot()
+    def poll_health(self):
         failed = 0
         reachable_hits = 0
         auth_limited = False
         current = {}
-        for key, (path, preferred_key) in endpoints.items():
-            try:
-                reachable, payload, status, _used_url = self._api_get(path)
-                if not reachable:
-                    failed += 1
-                    continue
+
+        system_payload = None
+        output_network_payload = None
+        input_payload = None
+
+        try:
+            reachable, payload, status, _used_url = self._api_get("devices/statistics", timeout=0.8)
+            if reachable:
                 reachable_hits += 1
                 if status in (401, 403):
                     auth_limited = True
-                    current[key] = None
-                    continue
-                scalar = self._first_scalar(payload, preferred_key=preferred_key)
-                current[key] = self._to_number_or_text(scalar)
-            except Exception:
+                elif status not in (404,):
+                    stats_root = payload
+                    if isinstance(stats_root, dict) and isinstance(stats_root.get("devices"), dict):
+                        stats_root = stats_root.get("devices")
+                    if isinstance(stats_root, dict) and isinstance(stats_root.get("statistics"), dict):
+                        stats_root = stats_root.get("statistics")
+                    if isinstance(stats_root, dict):
+                        current["error_count"] = self._to_int(stats_root.get("error-count"))
+                        current["online_count"] = self._to_int(stats_root.get("online-count"))
+                        current["associated_count"] = self._to_int(stats_root.get("associated-count"))
+            else:
                 failed += 1
+        except Exception:
+            failed += 1
+
+        try:
+            reachable, payload, status, _used_url = self._api_get("system", timeout=0.8)
+            if reachable:
+                reachable_hits += 1
+                if status in (401, 403):
+                    auth_limited = True
+                elif status not in (404,):
+                    system_payload = payload
+                    system_state_seed = self._extract_system_state(payload)
+                    current["software_version"] = system_state_seed.get("software_version")
+                    current["fan_case_1"] = system_state_seed.get("fan.case.one.status")
+                    current["fan_case_2"] = system_state_seed.get("fan.case.two.status")
+                    current["fan_fpga"] = system_state_seed.get("fan.fpga.status")
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
 
         if reachable_hits == 0:
             if not self.last_seen_ok:
@@ -513,6 +1349,181 @@ class BromptonSocket(QObject):
                 self.ip,
             )
 
+        prev_assoc_count = self._to_int(self._state.get("associated_count"))
+        curr_assoc_count = self._to_int(current.get("associated_count"))
+        if curr_assoc_count is not None and prev_assoc_count is not None and curr_assoc_count != prev_assoc_count:
+            delta = curr_assoc_count - prev_assoc_count
+            if delta < 0:
+                severity = "Error"
+                color = "red"
+                change_txt = f"{delta}"
+            elif delta > 0:
+                severity = "Recover"
+                color = "green"
+                change_txt = f"+{delta}"
+            else:
+                severity = "Info"
+                color = "gray"
+                change_txt = "0"
+            self.error_detected.emit(
+                color,
+                f"{severity},Controller,{self.name},BROMPTON,{self.ip},--,Associated tiles changed: {prev_assoc_count} -> {curr_assoc_count} ({change_txt})",
+                self.ip,
+            )
+
+        # Read richer blocks once per poll for source/failover/genlock/temperature/fan RPM/uptime/identity logs.
+        try:
+            reachable, payload, status, _used_url = self._api_get("output/network", timeout=0.8)
+            if reachable and status not in (401, 403, 404):
+                output_network_payload = payload
+        except Exception:
+            output_network_payload = None
+
+        try:
+            reachable, payload, status, _used_url = self._api_get("input", timeout=0.8)
+            if reachable and status not in (401, 403, 404):
+                input_payload = payload
+        except Exception:
+            input_payload = None
+
+        if input_payload is not None:
+            active_source = self._extract_active_source(input_payload)
+            prev_active_source = self._state.get("active_source")
+            if prev_active_source and active_source and prev_active_source != active_source:
+                self.error_detected.emit(
+                    "gray",
+                    f"Info,Controller,{self.name},BROMPTON,{self.ip},--,Active input changed: {prev_active_source} -> {active_source}",
+                    self.ip,
+                )
+            if active_source:
+                self._state["active_source"] = active_source
+
+            signal_map = self._extract_input_signal_map(input_payload)
+            prev_signal_map = self._state.get("input_signal_map")
+            if isinstance(prev_signal_map, dict):
+                for input_name, signal_desc in signal_map.items():
+                    old_desc = prev_signal_map.get(input_name)
+                    if old_desc is None or old_desc == signal_desc:
+                        continue
+                    severity, color = self._input_change_style(old_desc, signal_desc)
+                    self.error_detected.emit(
+                        color,
+                        f"{severity},Controller,{self.name},BROMPTON,{self.ip},--,Input format changed [{input_name}]: {old_desc} -> {signal_desc}",
+                        self.ip,
+                    )
+            self._state["input_signal_map"] = signal_map
+
+        if output_network_payload is not None:
+            net_state = self._extract_network_state(output_network_payload)
+            prev_net_state = self._state.get("network_state")
+            if isinstance(prev_net_state, dict):
+                for key, new_value in net_state.items():
+                    old_value = prev_net_state.get(key)
+                    if old_value == new_value or old_value is None or new_value is None:
+                        continue
+                    label_map = {
+                        "failover.enabled": "Failover enabled",
+                        "failover.role": "Failover role",
+                        "failover.is_active": "Failover active",
+                        "failover.partner_present": "Failover partner present",
+                        "genlock.source": "Genlock source",
+                        "genlock.internal_rate": "Genlock internal rate",
+                    }
+                    label = label_map.get(key, key)
+                    txt_new = str(new_value).lower() if isinstance(new_value, bool) else str(new_value)
+                    txt_old = str(old_value).lower() if isinstance(old_value, bool) else str(old_value)
+                    severity, color = self._input_change_style(txt_old, txt_new)
+                    self.error_detected.emit(
+                        color,
+                        f"{severity},Controller,{self.name},BROMPTON,{self.ip},--,{label} changed: {txt_old} -> {txt_new}",
+                        self.ip,
+                    )
+            self._state["network_state"] = net_state
+
+        if system_payload is not None:
+            system_state = self._extract_system_state(system_payload)
+            prev_system_state = self._state.get("system_state")
+            if not isinstance(prev_system_state, dict):
+                prev_system_state = {}
+
+            # Identity drift detection.
+            for key, label in (
+                ("processor_name", "Processor name"),
+                ("processor_type", "Processor type"),
+                ("serial_number", "Serial number"),
+                ("software_version", "Software version"),
+            ):
+                old_v = prev_system_state.get(key)
+                new_v = system_state.get(key)
+                if old_v and new_v and old_v != new_v:
+                    self.error_detected.emit(
+                        "orange",
+                        f"Warning,Controller,{self.name},BROMPTON,{self.ip},--,{label} changed: {old_v} -> {new_v}",
+                        self.ip,
+                    )
+
+            # Uptime reset = reboot indication.
+            old_uptime = prev_system_state.get("uptime_seconds")
+            new_uptime = system_state.get("uptime_seconds")
+            if isinstance(old_uptime, int) and isinstance(new_uptime, int) and new_uptime + 30 < old_uptime:
+                self.error_detected.emit(
+                    "orange",
+                    f"Warning,Controller,{self.name},BROMPTON,{self.ip},--,Processor reboot detected (uptime reset: {old_uptime}s -> {new_uptime}s)",
+                    self.ip,
+                )
+
+            # Temperature threshold alerts + recover.
+            for temp_key, warn_c in BROMPTON_TEMP_WARN_C.items():
+                state_key = f"temperature.{temp_key}"
+                temp_value = system_state.get(state_key)
+                if not isinstance(temp_value, (int, float)):
+                    continue
+                err_id = f"temp:{temp_key}"
+                was_active = err_id in self.active_errors
+                if temp_value >= warn_c:
+                    if not was_active:
+                        self.active_errors.add(err_id)
+                        self.error_detected.emit(
+                            "red",
+                            f"Error,Controller,{self.name},BROMPTON,{self.ip},--,High temperature {temp_key}: {temp_value:.1f}C (threshold {warn_c}C)",
+                            self.ip,
+                        )
+                else:
+                    if was_active and temp_value <= (warn_c - 2):
+                        self.active_errors.discard(err_id)
+                        self.error_detected.emit(
+                            "green",
+                            f"Recover,Controller,{self.name},BROMPTON,{self.ip},--,Temperature normal {temp_key}: {temp_value:.1f}C",
+                            self.ip,
+                        )
+
+            # Fan RPM anomaly alerts + recover.
+            for fan_key, min_rpm in BROMPTON_FAN_RPM_MIN.items():
+                rpm_key = f"fan.{fan_key}.speed"
+                rpm_value = system_state.get(rpm_key)
+                if not isinstance(rpm_value, int):
+                    continue
+                err_id = f"fanrpm:{fan_key}"
+                was_active = err_id in self.active_errors
+                if rpm_value < min_rpm:
+                    if not was_active:
+                        self.active_errors.add(err_id)
+                        self.error_detected.emit(
+                            "red",
+                            f"Error,Controller,{self.name},BROMPTON,{self.ip},--,Fan RPM low {fan_key}: {rpm_value} (threshold {min_rpm})",
+                            self.ip,
+                        )
+                else:
+                    if was_active and rpm_value >= (min_rpm + 150):
+                        self.active_errors.discard(err_id)
+                        self.error_detected.emit(
+                            "green",
+                            f"Recover,Controller,{self.name},BROMPTON,{self.ip},--,Fan RPM normal {fan_key}: {rpm_value}",
+                            self.ip,
+                        )
+
+            self._state["system_state"] = system_state
+
         fan_labels = {
             "fan_case_1": "Case fan 1",
             "fan_case_2": "Case fan 2",
@@ -538,6 +1549,128 @@ class BromptonSocket(QObject):
                     f"Error,Controller,{self.name},BROMPTON,{self.ip},--,{fan_label} status: failed",
                     self.ip,
                 )
+
+        # Log status changes of Tessera inputs (connected/disconnected/active...) when available.
+        input_status_map = {}
+        preferred_path = self._state.get("input_status_path")
+        candidate_paths = []
+        if preferred_path:
+            candidate_paths.append(preferred_path)
+        for path in BROMPTON_INPUT_STATUS_CANDIDATE_PATHS:
+            if path not in candidate_paths:
+                candidate_paths.append(path)
+
+        for path in candidate_paths:
+            try:
+                reachable, payload, status, _used_url = self._api_get(path, timeout=0.6)
+            except Exception:
+                continue
+            if not reachable or status in (401, 403, 404):
+                continue
+
+            parsed = self._extract_input_status_map(payload)
+            if not parsed:
+                continue
+
+            input_status_map = parsed
+            self._state["input_status_path"] = path
+            break
+
+        if input_status_map:
+            prev_input_status_map = self._state.get("input_status_map")
+            if isinstance(prev_input_status_map, dict):
+                for input_name, new_status in input_status_map.items():
+                    old_status = prev_input_status_map.get(input_name)
+                    if old_status is None or old_status == new_status:
+                        continue
+                    severity, color = self._input_change_style(old_status, new_status)
+                    self.error_detected.emit(
+                        color,
+                        f"{severity},Controller,{self.name},BROMPTON,{self.ip},--,Input status changed [{input_name}]: {old_status} -> {new_status}",
+                        self.ip,
+                    )
+            self._state["input_status_map"] = input_status_map
+
+        # Tessera's cable redundancy loop state is the closest match for a network cable disconnect log.
+        loop_numbers = self._state.get("cable_loop_numbers")
+        if not isinstance(loop_numbers, list) or not loop_numbers:
+            discovered_loops = []
+            net_root = output_network_payload
+            if isinstance(net_root, dict) and isinstance(net_root.get("output"), dict):
+                net_root = net_root.get("output")
+            if isinstance(net_root, dict) and isinstance(net_root.get("network"), dict):
+                net_root = net_root.get("network")
+            if isinstance(net_root, dict):
+                cable = net_root.get("cable-redundancy") if isinstance(net_root.get("cable-redundancy"), dict) else {}
+                loops = cable.get("loops") if isinstance(cable.get("loops"), dict) else {}
+                for key in loops.keys():
+                    try:
+                        discovered_loops.append(int(key))
+                    except (TypeError, ValueError):
+                        continue
+            loop_numbers = sorted(set(discovered_loops)) if discovered_loops else [1, 2]
+            self._state["cable_loop_numbers"] = loop_numbers
+
+        for loop_number in loop_numbers:
+            loop_key = f"cable_loop_{loop_number}"
+            loop_path = f"output/network/cable-redundancy/loops/{loop_number}/state"
+            loop_err_id = f"cable_loop:{loop_number}"
+            try:
+                reachable, payload, status, _used_url = self._api_get(loop_path, timeout=0.6)
+            except Exception:
+                reachable = False
+                payload = None
+                status = None
+
+            if not reachable:
+                continue
+            if status in (401, 403, 404):
+                continue
+
+            loop_state_raw = self._first_scalar(payload, preferred_key="state")
+            issues, seen_ok = self._parse_loop_state_summary(loop_state_raw)
+            if issues is None and not seen_ok:
+                continue
+
+            prev_issues = self._state.get(loop_key)
+            if not isinstance(prev_issues, list):
+                prev_issues = []
+
+            current_issues = list(issues or [])
+            prev_set = set(prev_issues)
+            curr_set = set(current_issues)
+
+            if prev_set == curr_set and ((bool(current_issues)) or seen_ok):
+                continue
+
+            self._state[loop_key] = current_issues
+            if current_issues:
+                self.active_errors.add(loop_err_id)
+                for issue in current_issues:
+                    if issue in prev_set:
+                        continue
+                    self.error_detected.emit(
+                        "red",
+                        f"Error,Controller,{self.name},BROMPTON,{self.ip},--,Cable redundancy loop {loop_number}: {issue}",
+                        self.ip,
+                    )
+
+                for issue in prev_issues:
+                    if issue in curr_set:
+                        continue
+                    self.error_detected.emit(
+                        "green",
+                        f"Recover,Controller,{self.name},BROMPTON,{self.ip},--,Cable redundancy loop {loop_number}: resolved ({issue})",
+                        self.ip,
+                    )
+            else:
+                self.active_errors.discard(loop_err_id)
+                if prev_issues or seen_ok:
+                    self.error_detected.emit(
+                        "green",
+                        f"Recover,Controller,{self.name},BROMPTON,{self.ip},--,Cable redundancy loop {loop_number}: Cable redundancy loop ok",
+                        self.ip,
+                    )
 
         self._state.update(current)
 
@@ -1549,6 +2682,8 @@ class MonitorWorker(QThread):
         self.running = True
         self.last_alerts = {}  # Track alerts per device
         self.force_scan_flag = False  # Trigger immediate scan
+        self.helios_receiver_cache = {}
+        self.helios_receiver_cache_ts = {}
 
     def update_processors(self, new_list):
         self.processors = new_list
@@ -1557,6 +2692,61 @@ class MonitorWorker(QThread):
     def force_scan(self):
         """Request immediate scan on next loop iteration."""
         self.force_scan_flag = True
+
+    def _refresh_helios_receiver_cache(self, ip):
+        now = time.time()
+        last = float(self.helios_receiver_cache_ts.get(ip, 0.0))
+        if now - last < 8.0:
+            return
+        self.helios_receiver_cache_ts[ip] = now
+
+        try:
+            resp = requests.get(f"http://{ip}/api/v1/public?dev.receivers", timeout=1.2)
+            if int(resp.status_code) != 200:
+                return
+            payload = resp.json() if resp.content else {}
+            receivers = payload.get("dev", {}).get("receivers", {}) if isinstance(payload, dict) else {}
+            if not isinstance(receivers, dict):
+                return
+
+            mapped = {}
+            for mac, details in receivers.items():
+                if not isinstance(details, dict):
+                    continue
+                mac_norm = str(mac or "").strip().lower().replace("-", ":")
+                if not mac_norm:
+                    continue
+
+                info = {"mac": str(mac), "sfp": "", "output": "", "chain_pos": ""}
+
+                # Fiber output (OPT): typically distroBoxPort on Helios receiver entries.
+                fiber = details.get("distroBoxPort", details.get("port"))
+                if fiber not in (None, ""):
+                    info["sfp"] = str(fiber)
+
+                # Network port: typically switchPort.
+                net_port = details.get("switchPort", details.get("output"))
+                if net_port not in (None, ""):
+                    info["output"] = str(net_port)
+
+                # Tile number: prefer chain order on the network port.
+                tile = details.get("string", details.get("position", details.get("index")))
+                if tile not in (None, ""):
+                    try:
+                        info["chain_pos"] = str(int(tile) + 1)
+                    except (TypeError, ValueError):
+                        info["chain_pos"] = str(tile)
+                else:
+                    x = details.get("x")
+                    y = details.get("y")
+                    if isinstance(x, int) and isinstance(y, int) and x >= 0 and y >= 0:
+                        info["chain_pos"] = f"{x},{y}"
+
+                mapped[mac_norm] = info
+
+            self.helios_receiver_cache[ip] = mapped
+        except Exception:
+            return
 
     def run(self):
         while self.running:
@@ -1587,6 +2777,7 @@ class MonitorWorker(QThread):
                             pass
 
                         try:
+                            self._refresh_helios_receiver_cache(ip)
                             sys_resp = requests.get(f"http://{ip}/api/v1/public?sys.alerts", timeout=1.0)
                             if sys_resp.status_code == 200:
                                 self._process_sys_alerts(ip, name, sys_resp.json())
@@ -1617,7 +2808,13 @@ class MonitorWorker(QThread):
                             if alert_store_key not in self.last_alerts or alert_id not in self.last_alerts[alert_store_key]:
                                 msg = alert.get("message", alert.get("desc", str(alert)))
                                 color = severity_to_color(severity_level)
-                                self.alert_signal.emit(ip, color, f"{name}: {msg}", "")
+                                msg_txt = str(msg or "").strip()
+                                msg_l = msg_txt.lower()
+                                if msg_l in ("none", "null"):
+                                    msg_txt = f"[{alert_id}] None"
+                                    self.alert_signal.emit(ip, "green", f"{name}: Recover: {msg_txt}", "")
+                                else:
+                                    self.alert_signal.emit(ip, color, f"{name}: {msg_txt}", "")
         
         # Store this alert set for next iteration
         if alert_store_key not in self.last_alerts:
@@ -1625,6 +2822,12 @@ class MonitorWorker(QThread):
         self.last_alerts[alert_store_key] = current_alert_ids
 
     def _severity_number_to_color(self, severity):
+        sev_txt = str(severity).strip().lower()
+        if sev_txt in ("none", "null"):
+            return "green"
+        if sev_txt in ("info", "notice"):
+            return "green"
+
         try:
             sev = int(severity)
         except:
@@ -1636,6 +2839,36 @@ class MonitorWorker(QThread):
         if sev == 5:
             return "green"
         return "gray"
+
+    def _apply_display_alert_rules(self, alert_key, msg, color):
+        key = str(alert_key or "").strip().lower()
+        txt = str(msg or "").strip()
+        txt_l = txt.lower()
+
+        # Strip optional leading [alertKey] when testing semantic value.
+        txt_core = re.sub(r"^\[[^\]]+\]\s*", "", txt_l).strip()
+
+        if txt_core in ("none", "null"):
+            if not txt.startswith("["):
+                txt = f"[{alert_key}] {txt}"
+            return "green", txt, True
+
+        if key.startswith("ethdrop") and "dropped link" in txt_l:
+            m = re.search(r"dropped\s+link\s*:\s*(\d+)", txt, flags=re.IGNORECASE)
+            if m:
+                try:
+                    dropped = int(m.group(1))
+                    if dropped > 0:
+                        return "red", txt, False
+                    return "green", txt, True
+                except ValueError:
+                    return "red", txt, False
+            return "red", txt, False
+
+        if key == "tilebackupmissing" and "backup missing" in txt_l:
+            return "red", txt, False
+
+        return color, txt, False
 
     def _process_sys_alerts(self, ip, name, sys_alerts_payload):
         """Parse sys.alerts payload and emit receiver-aware alerts with MAC addresses."""
@@ -1656,38 +2889,52 @@ class MonitorWorker(QThread):
             desc = str(alert_data.get("desc", "")).strip()
             msg = brief or desc or str(alert_key)
             color = self._severity_number_to_color(alert_data.get("severity"))
+            color, msg, is_recover = self._apply_display_alert_rules(alert_key, msg, color)
 
             devices = alert_data.get("devices", {}) if isinstance(alert_data.get("devices", {}), dict) else {}
             receivers = devices.get("receivers", {}) if isinstance(devices.get("receivers", {}), dict) else {}
 
             if receivers:
                 for receiver_mac, receiver_details in receivers.items():
+                    mac_norm = str(receiver_mac or "").strip().lower().replace("-", ":")
+                    cached_info = self.helios_receiver_cache.get(ip, {}).get(mac_norm, {})
+
                     # Parse receiver details (SFP, output, chain position, etc.)
                     receiver_info = {
                         "mac": str(receiver_mac),
-                        "sfp": "",
-                        "output": "",
-                        "chain_pos": ""
+                        "sfp": str(cached_info.get("sfp", "")),
+                        "output": str(cached_info.get("output", "")),
+                        "chain_pos": str(cached_info.get("chain_pos", ""))
                     }
                     
                     if isinstance(receiver_details, dict):
-                        # Debug print om te zien welke velden beschikbaar zijn
-                        print(f"[DEBUG] Receiver {receiver_mac} details: {receiver_details}")
-                        
-                        # Probeer verschillende veldnamen die Helios zou kunnen gebruiken
-                        receiver_info["sfp"] = str(receiver_details.get("sfp", receiver_details.get("port", "")))
-                        receiver_info["output"] = str(receiver_details.get("output", receiver_details.get("switch", "")))
-                        receiver_info["chain_pos"] = str(receiver_details.get("chain", receiver_details.get("position", receiver_details.get("index", ""))))
+                        # Probeer verschillende veldnamen die Helios direct in alert payload kan meesturen.
+                        sfp_v = receiver_details.get("sfp", receiver_details.get("port", ""))
+                        output_v = receiver_details.get("output", receiver_details.get("switch", ""))
+                        chain_v = receiver_details.get("chain", receiver_details.get("position", receiver_details.get("index", "")))
+
+                        if sfp_v not in (None, ""):
+                            receiver_info["sfp"] = str(sfp_v)
+                        if output_v not in (None, ""):
+                            receiver_info["output"] = str(output_v)
+                        if chain_v not in (None, ""):
+                            receiver_info["chain_pos"] = str(chain_v)
                     
                     alert_id = f"{alert_key}:{receiver_mac}:{msg}"
                     current_alert_ids.add(alert_id)
                     if alert_store_key not in self.last_alerts or alert_id not in self.last_alerts[alert_store_key]:
-                        self.alert_signal.emit(ip, color, f"{name}: [{alert_key}] {msg}", receiver_info)
+                        if is_recover:
+                            self.alert_signal.emit(ip, color, f"{name}: Recover: {msg}", receiver_info)
+                        else:
+                            self.alert_signal.emit(ip, color, f"{name}: {msg}", receiver_info)
             else:
                 alert_id = f"{alert_key}:{msg}"
                 current_alert_ids.add(alert_id)
                 if alert_store_key not in self.last_alerts or alert_id not in self.last_alerts[alert_store_key]:
-                    self.alert_signal.emit(ip, color, f"{name}: [{alert_key}] {msg}", {})
+                    if is_recover:
+                        self.alert_signal.emit(ip, color, f"{name}: Recover: {msg}", {})
+                    else:
+                        self.alert_signal.emit(ip, color, f"{name}: {msg}", {})
 
         self.last_alerts[alert_store_key] = current_alert_ids
     
@@ -1700,6 +2947,19 @@ class ScanWorker(QThread):
     found_signal = Signal(str, str, str)
     log_signal = Signal(str)
     finished_signal = Signal(int)
+
+    def __init__(self, scan_mode="ALL"):
+        super().__init__()
+        self.scan_mode = str(scan_mode or "ALL").upper()
+
+    def _wants_helios(self):
+        return self.scan_mode in ("ALL", "HELIOS")
+
+    def _wants_coex(self):
+        return self.scan_mode in ("ALL", "COEX")
+
+    def _wants_brompton(self):
+        return self.scan_mode in ("ALL", "BROMPTON")
 
     def run(self):
         self.log_signal.emit("Netwerk scannen...")
@@ -1749,43 +3009,54 @@ class ScanWorker(QThread):
         found_ips = set()
 
         # FASE 1: HTTP scan (snel, parallel) — alleen Helios
-        with ThreadPoolExecutor(max_workers=50) as executor:
-            results = list(executor.map(self.check_ip_http, ips_to_scan))
-            for i, result in enumerate(results):
-                self.progress_signal.emit(int((i/total)*50))  # tot 50%
-                if result:
-                    self.found_signal.emit(result[0], result[1], result[2])
-                    found_ips.add(result[0])
-                    found_count += 1
+        if self._wants_helios():
+            with ThreadPoolExecutor(max_workers=50) as executor:
+                results = list(executor.map(self.check_ip_http, ips_to_scan))
+                for i, result in enumerate(results):
+                    self.progress_signal.emit(int((i/total)*50))  # tot 50%
+                    if result:
+                        self.found_signal.emit(result[0], result[1], result[2])
+                        found_ips.add(result[0])
+                        found_count += 1
+        else:
+            self.log_signal.emit("Helios scan overgeslagen (scanfilter)")
+            self.progress_signal.emit(50)
 
         # FASE 2: SNMP scan (parallel, licht) — voor IPs die niet via HTTP gevonden zijn
-        self.log_signal.emit("SNMP scan voor Novastar COEX...")
-        snmp_engine = self._make_snmp_engine()
-        if snmp_engine is not None:
+        if self._wants_coex():
+            self.log_signal.emit("SNMP scan voor Novastar COEX...")
+            snmp_engine = self._make_snmp_engine()
+            if snmp_engine is not None:
+                remaining = [ip for ip in ips_to_scan if ip not in found_ips]
+                if remaining:
+                    with ThreadPoolExecutor(max_workers=64) as executor:
+                        results = list(executor.map(lambda ip: self.check_ip_snmp(ip, snmp_engine), remaining))
+                        for i, result in enumerate(results):
+                            self.progress_signal.emit(50 + int((i/max(len(remaining),1))*50))
+                            if result:
+                                self.found_signal.emit(result[0], result[1], result[2])
+                                found_ips.add(result[0])
+                                found_count += 1
+        else:
+            self.log_signal.emit("COEX scan overgeslagen (scanfilter)")
+
+        # FASE 3: HTTP scan voor BROMPTON API endpoints
+        if self._wants_brompton():
+            self.log_signal.emit("HTTP scan voor BROMPTON Tessera API...")
             remaining = [ip for ip in ips_to_scan if ip not in found_ips]
             if remaining:
                 with ThreadPoolExecutor(max_workers=64) as executor:
-                    results = list(executor.map(lambda ip: self.check_ip_snmp(ip, snmp_engine), remaining))
+                    results = list(executor.map(self.check_ip_brompton, remaining))
                     for i, result in enumerate(results):
                         self.progress_signal.emit(50 + int((i/max(len(remaining),1))*50))
                         if result:
                             self.found_signal.emit(result[0], result[1], result[2])
                             found_ips.add(result[0])
                             found_count += 1
+        else:
+            self.log_signal.emit("BROMPTON scan overgeslagen (scanfilter)")
 
-        # FASE 3: HTTP scan voor BROMPTON API endpoints
-        self.log_signal.emit("HTTP scan voor BROMPTON Tessera API...")
-        remaining = [ip for ip in ips_to_scan if ip not in found_ips]
-        if remaining:
-            with ThreadPoolExecutor(max_workers=64) as executor:
-                results = list(executor.map(self.check_ip_brompton, remaining))
-                for i, result in enumerate(results):
-                    self.progress_signal.emit(50 + int((i/max(len(remaining),1))*50))
-                    if result:
-                        self.found_signal.emit(result[0], result[1], result[2])
-                        found_ips.add(result[0])
-                        found_count += 1
-
+        self.progress_signal.emit(100)
         self.finished_signal.emit(found_count)
 
     def _make_snmp_engine(self):
@@ -1993,7 +3264,7 @@ class ProcessorCard(QFrame):
         n = QLabel(str(name)); n.setFont(QFont("Segoe UI", 11, QFont.Bold)); n.setStyleSheet("border:none; background:transparent; color:#fff;")
         t = QLabel(display_type_label(ptype).upper()); t.setFont(QFont("Segoe UI", 8, QFont.Bold)); t.setStyleSheet("border:none; color:#2a82da; background:#111; padding:2px 6px; border-radius:3px;")
         top.addWidget(n); top.addStretch(); top.addWidget(t); self.inner_layout.addLayout(top)
-        i = QLabel(str(ip)); i.setFont(QFont("Consolas", 9)); i.setStyleSheet("border:none; background:transparent; color:#888;"); self.inner_layout.addWidget(i)
+        i = QLabel(f'<a href="http://{ip}" style="color:#2a82da; text-decoration:underline;">{ip}</a>'); i.setFont(QFont("Consolas", 9)); i.setTextFormat(Qt.RichText); i.setTextInteractionFlags(Qt.LinksAccessibleByMouse); i.setOpenExternalLinks(True); i.setCursor(Qt.PointingHandCursor); i.setToolTip(f"Open http://{ip} in browser"); i.setStyleSheet("border:none; background:transparent;"); i.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred); self.inner_layout.addWidget(i)
         self.outer_layout.addWidget(self.inner_frame); self.update_style()
 
     def mousePressEvent(self, e):
@@ -2032,6 +3303,13 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Configure Processors")
         self.resize(950, 600)
+        self.setMinimumSize(640, 420)
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            target_w = min(950, max(640, avail.width() - 40))
+            target_h = min(700, max(420, avail.height() - 60))
+            self.resize(target_w, target_h)
         self.processors = list(current_processors)
         auth_data = current_web_auth if isinstance(current_web_auth, dict) else {}
         web_server_data = current_web_server if isinstance(current_web_server, dict) else {}
@@ -2042,7 +3320,16 @@ class SettingsDialog(QDialog):
         
         self.setStyleSheet("QDialog { background-color: #121212; } QLabel { color: #eaeaea; font-family: 'Segoe UI'; } QLineEdit, QComboBox { background-color: #1e1e1e; border: 1px solid #333; border-radius: 5px; padding: 10px; color: #fff; } QListWidget { background-color: #1e1e1e; border: 1px solid #333; border-radius: 5px; color: #ddd; } QPushButton { background-color: #333; color: white; border-radius: 5px; padding: 10px; border: none; } QProgressBar { border: none; background-color: #111; height: 4px; } QProgressBar::chunk { background-color: #2a82da; }")
         
-        main = QVBoxLayout(self)
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        main = QVBoxLayout(content)
         main.setContentsMargins(30,30,30,30)
         main.setSpacing(25)
         
@@ -2104,6 +3391,12 @@ class SettingsDialog(QDialog):
         line = QFrame(); line.setFrameShape(QFrame.HLine); line.setStyleSheet("color: #333;")
         right.addWidget(line)
         right.addWidget(QLabel("Pro Scanner", styleSheet="font-weight: bold; color: #aaa; margin-top: 10px;"))
+
+        right.addWidget(QLabel("Scan Target:"))
+        self.cmb_scan_target = QComboBox()
+        self.cmb_scan_target.addItems(["ALL", "BROMPTON", "HELIOS", "COEX"])
+        self.cmb_scan_target.setCurrentText("ALL")
+        right.addWidget(self.cmb_scan_target)
         
         sl = QHBoxLayout()
         self.btn_scan = QPushButton("SCAN NETWORK")
@@ -2180,6 +3473,9 @@ class SettingsDialog(QDialog):
         footer.addWidget(btn_close)
         main.addLayout(footer)
 
+        scroll.setWidget(content)
+        root_layout.addWidget(scroll)
+
     def refresh_list(self):
         self.list_widget.clear()
         for p in self.processors:
@@ -2251,8 +3547,9 @@ class SettingsDialog(QDialog):
 
     def start_scan(self):
         self.btn_scan.setEnabled(False); self.btn_scan.setText("SCANNING...")
-        self.scan_lbl.setText("Scanning subnets...")
-        self.scanner = ScanWorker()
+        scan_target = self.cmb_scan_target.currentText().strip().upper()
+        self.scan_lbl.setText(f"Scanning subnets... ({scan_target})")
+        self.scanner = ScanWorker(scan_mode=scan_target)
         self.scanner.progress_signal.connect(self.progress.setValue)
         self.scanner.found_signal.connect(self.on_found)
         self.scanner.log_signal.connect(self.scan_lbl.setText)
@@ -2316,6 +3613,13 @@ class LEDLoggerApp(QMainWindow):
         self.history_data = load_json(HISTORY_FILE, [])
         self.processors = self.config["processors"]
         self.processor_widgets = {}; self.sockets = {}; self.coex_threads = {}; self.brompton_threads = {}; self.selected_ip = None; self.log_history = []
+        self.helios_identify_state = {}
+        self.helios_identify_checkboxes = {}
+        self.live_group_expanded = {}
+        self.log_row_meta = {}
+        self.log_group_children = {}
+        self.log_group_targets = {}
+        self.group_identify_checkboxes = {}
         self.trap_listener = None
         self.web_server = None
         self.web_thread = None
@@ -2600,20 +3904,22 @@ class LEDLoggerApp(QMainWindow):
         
         # Live Tab
         self.log_table = QTableWidget()
-        self.log_table.setColumnCount(8)
-        self.log_table.setHorizontalHeaderLabels(["Time", "Device", "MAC", "OPT", "PORT", "TILE", "Message", "OID"])
+        self.log_table.setColumnCount(9)
+        self.log_table.setHorizontalHeaderLabels(["Time", "Device", "MAC", "ID", "OPT", "PORT", "TILE", "Message", "OID"])
         self.log_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.log_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.log_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.log_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.log_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.log_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        self.log_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
-        self.log_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Interactive)
-        self.log_table.setColumnWidth(7, 280)
+        self.log_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        self.log_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
+        self.log_table.horizontalHeader().setSectionResizeMode(8, QHeaderView.Interactive)
+        self.log_table.setColumnWidth(8, 280)
         self.log_table.verticalHeader().setVisible(False)
         self.log_table.setSelectionMode(QTableWidget.NoSelection)
         self.log_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.log_table.cellClicked.connect(self.on_log_table_cell_clicked)
         self.log_table.setStyleSheet("""
             QTableWidget { 
                 background: #0f0f0f; 
@@ -2748,6 +4054,161 @@ class LEDLoggerApp(QMainWindow):
                 return name
         return ip
 
+    def _processor_type_for_ip(self, ip):
+        proc = next((p for p in self.processors if p.get("ip") == ip), None)
+        if not proc:
+            return ""
+        return str(proc.get("type", "")).strip().lower()
+
+    def _normalize_receiver_mac(self, mac_text):
+        txt = str(mac_text or "").strip().lower().replace("-", ":")
+        if re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", txt):
+            return txt
+        return ""
+
+    def _sync_identify_checkboxes(self, ip, mac, checked, source_checkbox=None):
+        key = (str(ip or "").strip(), str(mac or "").strip().lower())
+        widgets = self.helios_identify_checkboxes.get(key, [])
+        alive = []
+        for cb in widgets:
+            try:
+                if cb is source_checkbox:
+                    alive.append(cb)
+                    continue
+                cb.blockSignals(True)
+                cb.setChecked(bool(checked))
+                cb.blockSignals(False)
+                alive.append(cb)
+            except Exception:
+                continue
+        self.helios_identify_checkboxes[key] = alive
+
+    def _identify_target_from_entry(self, entry):
+        ip_text = str(entry.get("ip", "") or "").strip()
+        if not ip_text:
+            return None
+        if "helios" not in self._processor_type_for_ip(ip_text):
+            return None
+        receiver_info = entry.get("receiver_info", {}) if isinstance(entry.get("receiver_info", {}), dict) else {}
+        mac_norm = self._normalize_receiver_mac(receiver_info.get("mac", ""))
+        if not mac_norm:
+            return None
+        return (ip_text, mac_norm)
+
+    def _sync_group_identify_checkbox(self, group_id):
+        cb = self.group_identify_checkboxes.get(group_id)
+        if cb is None:
+            return
+        targets = self.log_group_targets.get(group_id, [])
+        if not targets:
+            cb.blockSignals(True)
+            cb.setChecked(False)
+            cb.blockSignals(False)
+            return
+
+        checked = all(bool(self.helios_identify_state.get((ip, mac), False)) for ip, mac in targets)
+        cb.blockSignals(True)
+        cb.setChecked(checked)
+        cb.blockSignals(False)
+
+    def _refresh_group_checkboxes_for_target(self, ip, mac):
+        target = (str(ip or "").strip(), str(mac or "").strip().lower())
+        for group_id, targets in self.log_group_targets.items():
+            if target in targets:
+                self._sync_group_identify_checkbox(group_id)
+
+    def _on_group_identify_toggled(self, group_id, checked, source_checkbox=None):
+        targets = list(dict.fromkeys(self.log_group_targets.get(group_id, [])))
+        if not targets:
+            return
+
+        previous = {t: bool(self.helios_identify_state.get(t, False)) for t in targets}
+        for ip_txt, mac_txt in targets:
+            self.helios_identify_state[(ip_txt, mac_txt)] = bool(checked)
+            self._sync_identify_checkboxes(ip_txt, mac_txt, checked, source_checkbox=None)
+            ok = self._set_helios_receiver_identify(ip_txt, mac_txt, bool(checked))
+            if not ok:
+                prev = previous[(ip_txt, mac_txt)]
+                self.helios_identify_state[(ip_txt, mac_txt)] = prev
+                self._sync_identify_checkboxes(ip_txt, mac_txt, prev, source_checkbox=None)
+
+        self._sync_group_identify_checkbox(group_id)
+
+    def _http_send_helios_identify(self, ip, mac, enabled):
+        payload = {
+            "dev": {
+                "receivers": {
+                    mac: {
+                        "identifyEnabled": bool(enabled)
+                    }
+                }
+            }
+        }
+        url = f"http://{ip}/api/v1/data"
+        for method in ("POST", "PATCH"):
+            try:
+                resp = requests.request(method, url, json=payload, timeout=1.2)
+                if not (200 <= int(resp.status_code) < 300):
+                    continue
+
+                # Prefer direct confirmation from response body.
+                try:
+                    data = resp.json() if resp.content else {}
+                    got = (
+                        data.get("dev", {})
+                        .get("receivers", {})
+                        .get(mac, {})
+                        .get("identifyEnabled")
+                    )
+                    if isinstance(got, bool):
+                        return got == bool(enabled)
+                except Exception:
+                    pass
+
+                # Fallback readback when body is incomplete.
+                try:
+                    read = requests.get(f"http://{ip}/api/v1/public?dev.receivers.{mac}", timeout=1.2)
+                    if 200 <= int(read.status_code) < 300:
+                        data = read.json() if read.content else {}
+                        got = (
+                            data.get("dev", {})
+                            .get("receivers", {})
+                            .get(mac, {})
+                            .get("identifyEnabled")
+                        )
+                        if isinstance(got, bool):
+                            return got == bool(enabled)
+                except Exception:
+                    pass
+            except Exception:
+                continue
+        return False
+
+    def _set_helios_receiver_identify(self, ip, mac, enabled):
+        sent = self._http_send_helios_identify(ip, mac, enabled)
+
+        if sent:
+            return True
+
+        self.add_log_entry("orange", f"Identify command failed for {mac}", ip, receiver_info={"mac": mac})
+        return False
+
+    def _on_identify_checkbox_toggled(self, ip, mac, checked, source_checkbox=None):
+        ip_txt = str(ip or "").strip()
+        mac_txt = self._normalize_receiver_mac(mac)
+        if not ip_txt or not mac_txt:
+            return
+
+        key = (ip_txt, mac_txt)
+        self.helios_identify_state[key] = bool(checked)
+        self._sync_identify_checkboxes(ip_txt, mac_txt, checked, source_checkbox=source_checkbox)
+        ok = self._set_helios_receiver_identify(ip_txt, mac_txt, bool(checked))
+        if not ok:
+            self.helios_identify_state[key] = not bool(checked)
+            self._sync_identify_checkboxes(ip_txt, mac_txt, not bool(checked), source_checkbox=None)
+
+        self._refresh_group_checkboxes_for_target(ip_txt, mac_txt)
+
     def _inject_processor_name_in_csv(self, msg, ip):
         """Vervang het controller-name veld in CSV-achtige logs met de actuele ingestelde naam."""
         if ",Controller," not in msg:
@@ -2774,6 +4235,36 @@ class LEDLoggerApp(QMainWindow):
         name = parts[2].strip()
         desc = parts[6].strip().replace(" : ", ": ")
         return f"{severity}: {name} - {desc}"
+
+    def _strip_display_prefix(self, msg):
+        txt = str(msg or "")
+        if txt.lower().startswith("display:"):
+            return txt.split(":", 1)[1].strip()
+        return txt
+
+    def _normalize_recover_text(self, msg):
+        txt = str(msg or "")
+        txt = re.sub(r"\[?ethDrop0\]?", "Ethernet Link", txt, flags=re.IGNORECASE)
+        txt = re.sub(r"\[?powFiberLow\]?", "Low fiber power", txt, flags=re.IGNORECASE)
+        txt = re.sub(
+            r"Recover:\s*\[tileBackupMissing\]\s*(?:None|null)",
+            "Recover: Backup Missing",
+            txt,
+            flags=re.IGNORECASE,
+        )
+        txt = re.sub(
+            r"Recover:\s*\[ethDrop0\]\s*(?:None|null)",
+            "Recover: Ethernet Link",
+            txt,
+            flags=re.IGNORECASE,
+        )
+        txt = re.sub(
+            r"Recover:\s*\[noInput\]\s*(?:None|null)",
+            "Recover: No input",
+            txt,
+            flags=re.IGNORECASE,
+        )
+        return txt
 
     def _receiver_info_from_coex_trap(self, msg):
         """Vul SFP/OUT/POS kolommen voor COEX trapregels waar poortinformatie in de beschrijving zit."""
@@ -2934,8 +4425,42 @@ class LEDLoggerApp(QMainWindow):
         for p_ip, card in self.processor_widgets.items(): card.set_selected(p_ip == self.selected_ip)
         self.refresh_log_display()
 
+    @Slot(str)
+    def run_morning_test(self, target_ip=None):
+        targets = []
+        if target_ip:
+            sock = self.sockets.get(target_ip)
+            if isinstance(sock, BromptonSocket):
+                targets = [target_ip]
+            else:
+                self.add_log_entry("orange", "Geselecteerde kaart is geen BROMPTON processor.", "SYSTEM")
+                return
+        elif self.selected_ip:
+            sock = self.sockets.get(self.selected_ip)
+            if isinstance(sock, BromptonSocket):
+                targets = [self.selected_ip]
+            else:
+                self.add_log_entry("orange", "Selecteer een BROMPTON kaart of deselecteer om alle BROMPTON processors te testen.", "SYSTEM")
+                return
+        else:
+            for ip, sock in self.sockets.items():
+                if isinstance(sock, BromptonSocket):
+                    targets.append(ip)
+
+        if not targets:
+            self.add_log_entry("orange", "Geen BROMPTON processor gevonden voor TEST.", "SYSTEM")
+            return
+
+        self.add_log_entry("gray", f"Test gestart voor {len(targets)} BROMPTON processor(s).", "SYSTEM")
+        for ip in targets:
+            sock = self.sockets.get(ip)
+            if isinstance(sock, BromptonSocket):
+                QMetaObject.invokeMethod(sock, "trigger_test", Qt.QueuedConnection)
+
     def add_log_entry(self, color, msg, ip, receiver_info=None, oid=""):
+        color = normalize_log_color(color, ip)
         msg = self._strip_ip_from_controller_csv(msg)
+        msg = self._normalize_recover_text(msg)
         entry = {
             "time": datetime.now().strftime("%H:%M:%S"),
             "color": color,
@@ -2946,19 +4471,133 @@ class LEDLoggerApp(QMainWindow):
         }
         self.log_history.append(entry)
         if self.selected_ip is None or self.selected_ip == ip or ip == "SYSTEM": 
-            self.append_log_row(entry)
+            self.refresh_log_display()
+
+    def _entry_group_signature(self, entry):
+        return (
+            str(entry.get("ip", "") or ""),
+            str(entry.get("color", "") or ""),
+            str(entry.get("msg", "") or ""),
+            str(entry.get("oid", "") or ""),
+        )
+
+    @Slot(int, int)
+    def on_log_table_cell_clicked(self, row, _column):
+        meta = self.log_row_meta.get(row)
+        if not meta or meta.get("type") != "group_parent":
+            return
+
+        group_id = meta.get("group_id")
+        if group_id is None:
+            return
+
+        expanded = bool(self.live_group_expanded.get(group_id, False))
+        new_expanded = not expanded
+        self.live_group_expanded[group_id] = new_expanded
+
+        for child_row in self.log_group_children.get(group_id, []):
+            self.log_table.setRowHidden(child_row, not new_expanded)
+
+        count = int(meta.get("count", 0))
+        time_item = self.log_table.item(row, 0)
+        if time_item is not None:
+            arrow = "▼" if new_expanded else "▶"
+            time_item.setText(f"{arrow} {count}")
 
     def refresh_log_display(self):
         self.log_table.setUpdatesEnabled(False)
         self.log_table.setRowCount(0)
+        self.helios_identify_checkboxes = {}
+        self.log_row_meta = {}
+        self.log_group_children = {}
+        self.log_group_targets = {}
+        self.group_identify_checkboxes = {}
+
+        visible_entries = []
         for entry in self.log_history:
             if self.selected_ip is None or entry["ip"] == self.selected_ip or entry["ip"] == "SYSTEM":
-                self.append_log_row(entry, auto_scroll=False)
+                visible_entries.append(entry)
+
+        groups = []
+        for entry in visible_entries:
+            sig = self._entry_group_signature(entry)
+            if groups and groups[-1]["signature"] == sig:
+                groups[-1]["entries"].append(entry)
+            else:
+                groups.append({"signature": sig, "entries": [entry]})
+
+        for idx, group in enumerate(groups):
+            entries = group["entries"]
+            if len(entries) == 1:
+                self.append_log_row(entries[0], auto_scroll=False)
+                continue
+
+            first = entries[0]
+            group_id = (group["signature"], first.get("time", ""), idx)
+            expanded = bool(self.live_group_expanded.get(group_id, False))
+
+            parent_entry = dict(first)
+            parent_entry["receiver_info"] = {}
+            parent_row = self.append_log_row(parent_entry, auto_scroll=False, allow_identify=False)
+
+            parent_time_item = self.log_table.item(parent_row, 0)
+            if parent_time_item is not None:
+                arrow = "▼" if expanded else "▶"
+                parent_time_item.setText(f"{arrow} {len(entries)}")
+                parent_time_item.setToolTip(f"Bulk log: {len(entries)} items")
+
+            self.log_row_meta[parent_row] = {
+                "type": "group_parent",
+                "group_id": group_id,
+                "count": len(entries),
+            }
+
+            group_targets = []
+            for ge in entries:
+                target = self._identify_target_from_entry(ge)
+                if target and target not in group_targets:
+                    group_targets.append(target)
+            self.log_group_targets[group_id] = group_targets
+
+            if group_targets:
+                parent_id_box = QWidget()
+                parent_id_layout = QHBoxLayout(parent_id_box)
+                parent_id_layout.setContentsMargins(0, 0, 0, 0)
+                parent_id_layout.setAlignment(Qt.AlignCenter)
+
+                parent_id_cb = QCheckBox()
+                parent_id_cb.setToolTip(f"Identify all in group ({len(group_targets)})")
+                parent_id_cb.setStyleSheet(
+                    "QCheckBox::indicator { width: 14px; height: 14px; }"
+                    "QCheckBox::indicator:unchecked { border: 1px solid #666; background: #121212; }"
+                    "QCheckBox::indicator:checked { border: 1px solid #2ecc71; background: #2ecc71; }"
+                )
+                parent_id_cb.stateChanged.connect(
+                    lambda state, gid=group_id, cb=parent_id_cb:
+                    self._on_group_identify_toggled(gid, int(state) != 0, source_checkbox=cb)
+                )
+                parent_id_layout.addWidget(parent_id_cb)
+                self.log_table.setCellWidget(parent_row, 3, parent_id_box)
+                self.group_identify_checkboxes[group_id] = parent_id_cb
+                self._sync_group_identify_checkbox(group_id)
+
+            child_rows = []
+            for child_entry in entries:
+                child_row = self.append_log_row(child_entry, auto_scroll=False)
+                child_time_item = self.log_table.item(child_row, 0)
+                if child_time_item is not None:
+                    child_time_item.setText(f"  {child_time_item.text()}")
+                self.log_row_meta[child_row] = {"type": "group_child", "group_id": group_id}
+                child_rows.append(child_row)
+                self.log_table.setRowHidden(child_row, not expanded)
+
+            self.log_group_children[group_id] = child_rows
+
         self.log_table.setUpdatesEnabled(True)
         self.log_table.viewport().update()
         self.log_table.scrollToBottom()
 
-    def append_log_row(self, entry, auto_scroll=True):
+    def append_log_row(self, entry, auto_scroll=True, allow_identify=True):
         row = self.log_table.rowCount()
         self.log_table.insertRow(row)
         
@@ -2973,6 +4612,7 @@ class LEDLoggerApp(QMainWindow):
         device_item = QTableWidgetItem(device_text)
         device_item.setForeground(QColor("#888"))
         device_item.setTextAlignment(Qt.AlignCenter)
+        device_item.setToolTip(device_text)
         self.log_table.setItem(row, 1, device_item)
         
         # Receiver info (MAC, SFP, Output, Chain Position)
@@ -2985,27 +4625,72 @@ class LEDLoggerApp(QMainWindow):
         
         # MAC
         mac_item = QTableWidgetItem(mac_text)
-        mac_item.setForeground(QColor("#ff9800") if mac_text != "-" else QColor("#444"))
+        mac_item.setForeground(QColor("#888") if mac_text != "-" else QColor("#444"))
         mac_item.setTextAlignment(Qt.AlignCenter)
+        if mac_text and mac_text != "-":
+            mac_item.setToolTip(mac_text)
         self.log_table.setItem(row, 2, mac_item)
+
+        # Identify checkbox (Helios only, requires valid receiver MAC)
+        ip_text = str(entry.get("ip", "") or "").strip()
+        ptype = self._processor_type_for_ip(ip_text)
+        mac_norm = self._normalize_receiver_mac(mac_text)
+        if allow_identify and ip_text and mac_norm and "helios" in ptype:
+            key = (ip_text, mac_norm)
+            checked = bool(self.helios_identify_state.get(key, False))
+
+            identify_box = QWidget()
+            identify_layout = QHBoxLayout(identify_box)
+            identify_layout.setContentsMargins(0, 0, 0, 0)
+            identify_layout.setAlignment(Qt.AlignCenter)
+
+            identify_cb = QCheckBox()
+            identify_cb.setToolTip(f"Identify receiver {mac_norm}")
+            identify_cb.setStyleSheet(
+                "QCheckBox::indicator { width: 14px; height: 14px; }"
+                "QCheckBox::indicator:unchecked { border: 1px solid #666; background: #121212; }"
+                "QCheckBox::indicator:checked { border: 1px solid #2ecc71; background: #2ecc71; }"
+            )
+            identify_cb.blockSignals(True)
+            identify_cb.setChecked(checked)
+            identify_cb.blockSignals(False)
+            identify_cb.stateChanged.connect(
+                lambda state, ip_v=ip_text, mac_v=mac_norm, cb=identify_cb:
+                self._on_identify_checkbox_toggled(ip_v, mac_v, int(state) != 0, source_checkbox=cb)
+            )
+
+            identify_layout.addWidget(identify_cb)
+            self.log_table.setCellWidget(row, 3, identify_box)
+            self.helios_identify_checkboxes.setdefault(key, []).append(identify_cb)
+        else:
+            id_item = QTableWidgetItem("-")
+            id_item.setForeground(QColor("#444"))
+            id_item.setTextAlignment(Qt.AlignCenter)
+            self.log_table.setItem(row, 3, id_item)
         
         # SFP
         sfp_item = QTableWidgetItem(sfp_text)
-        sfp_item.setForeground(QColor("#2a82da") if sfp_text != "-" else QColor("#444"))
+        sfp_item.setForeground(QColor("#888") if sfp_text != "-" else QColor("#444"))
         sfp_item.setTextAlignment(Qt.AlignCenter)
-        self.log_table.setItem(row, 3, sfp_item)
+        if sfp_text and sfp_text != "-":
+            sfp_item.setToolTip(sfp_text)
+        self.log_table.setItem(row, 4, sfp_item)
         
         # Output
         output_item = QTableWidgetItem(output_text)
-        output_item.setForeground(QColor("#2a82da") if output_text != "-" else QColor("#444"))
+        output_item.setForeground(QColor("#888") if output_text != "-" else QColor("#444"))
         output_item.setTextAlignment(Qt.AlignCenter)
-        self.log_table.setItem(row, 4, output_item)
+        if output_text and output_text != "-":
+            output_item.setToolTip(output_text)
+        self.log_table.setItem(row, 5, output_item)
         
         # Chain Position
         chain_item = QTableWidgetItem(chain_text)
-        chain_item.setForeground(QColor("#2a82da") if chain_text != "-" else QColor("#444"))
+        chain_item.setForeground(QColor("#888") if chain_text != "-" else QColor("#444"))
         chain_item.setTextAlignment(Qt.AlignCenter)
-        self.log_table.setItem(row, 5, chain_item)
+        if chain_text and chain_text != "-":
+            chain_item.setToolTip(chain_text)
+        self.log_table.setItem(row, 6, chain_item)
         
         # Message
         if entry["color"] == "red":
@@ -3019,16 +4704,21 @@ class LEDLoggerApp(QMainWindow):
         
         msg_item = QTableWidgetItem(entry["msg"])
         msg_item.setForeground(c)
-        self.log_table.setItem(row, 6, msg_item)
+        msg_item.setToolTip(str(entry["msg"]))
+        self.log_table.setItem(row, 7, msg_item)
 
         # OID
         oid_text = entry.get("oid", "")
         oid_item = QTableWidgetItem(oid_text)
         oid_item.setForeground(QColor("#666666") if not oid_text else QColor("#aaaaaa"))
-        self.log_table.setItem(row, 7, oid_item)
+        if oid_text:
+            oid_item.setToolTip(str(oid_text))
+        self.log_table.setItem(row, 8, oid_item)
         
         if auto_scroll:
             self.log_table.scrollToBottom()
+
+        return row
 
     def clear_log(self):
         """Slaat de huidige sessie op en start een schone lei."""
