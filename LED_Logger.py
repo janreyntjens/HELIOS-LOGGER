@@ -41,7 +41,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- CONSTANTEN ---
 APP_NAME = "LED Logger"
-VERSION = "1.1.0-beta"
+VERSION = "1.1.3"
 LOGO_FILE = "logo.ico"  # <--- HIER ZAT DE FOUT (ontbrekend aanhalingsteken)
 if getattr(sys, "frozen", False):
     APP_BASE_DIR = os.path.dirname(sys.executable)
